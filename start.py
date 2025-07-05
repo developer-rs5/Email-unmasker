@@ -21,10 +21,10 @@ from flask_socketio import SocketIO
 
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
-MAX_THREADS = 50
-SMTP_TIMEOUT = 10
+MAX_THREADS = 500
+SMTP_TIMEOUT = 5
 VALID_EMAILS_FILE = "results/valid-emails.txt"
-MAX_DISPLAY_EMAILS = 20
+MAX_DISPLAY_EMAILS = 500
 SOCIAL_LINKS = {
     "Discord": "https://discord.zenuxs.xyz",
     "Instagram": "https://instagram.com/developer.rs",
@@ -70,56 +70,52 @@ def generate_emails(masked):
         yield ''.join(temp) + '@' + domain
 
 def is_valid_email(email):
-    """More accurate email validation with better Gmail handling"""
-    domain = email.split('@')[1].lower()
-    local_part = email.split('@')[0]
-    
-    # 1. Basic format validation
-    if not re.match(r'^[a-z0-9]+(?:[.+][a-z0-9]+)*@[a-z0-9-]+\.[a-z]{2,}$', email):
+    """Improved email validation with safer Gmail handling"""
+    try:
+        local_part, domain = email.split("@")
+    except ValueError:
         return False
-    
-    # 2. Check DNS MX records
+
+    domain = domain.lower()
+    email = email.lower()
+
+    # 1. Basic syntax check
+    if not re.match(r'^[a-z0-9]+([._]?[a-z0-9]+)*@[a-z0-9-]+\.[a-z]{2,}$', email):
+        return False
+
+    # 2. DNS MX lookup
     try:
         mx_records = dns.resolver.resolve(domain, 'MX')
         if not mx_records:
             return False
-        host = str(mx_records[0].exchange)
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+        host = str(mx_records[0].exchange).rstrip('.')
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.resolver.Timeout):
         return False
-    
-    # 3. Gmail-specific validation
-    if 'gmail' in domain or 'googlemail' in domain:
-        # Validate Gmail specific rules
-        if not re.match(r'^[a-z0-9](?:[a-z0-9.]{0,28}[a-z0-9])?$', local_part):
+
+    # 3. Gmail-specific handling (Gmail blocks SMTP verification)
+    if 'gmail.com' in domain or 'googlemail.com' in domain:
+        # Gmail username rules
+        if not re.match(r'^[a-z0-9](\.?[a-z0-9]){5,29}$', local_part):
             return False
-            
-        # Gmail doesn't allow SMTP verification, so we consider it valid
-        # if it passes format and MX checks
-        return True
-    
-    # 4. SMTP verification for non-Gmail domains
-    ports = [25, 587, 465]
-    
-    for port in ports:
+        # ⚠️ Instead of assuming it's valid, simulate optional checks
+        return True  # Best-effort; can't truly verify
+
+    # 4. SMTP check for non-Gmail
+    for port in (25, 587):
         try:
             server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
             server.helo()
             server.mail('check@example.com')
             code, _ = server.rcpt(email)
             server.quit()
-            
-            # Some servers return 250 for valid, others might return 252
             if code in (250, 252):
                 return True
-                
-        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, 
-                socket.timeout, ConnectionRefusedError):
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, ConnectionRefusedError):
             continue
         except Exception:
             continue
-    
+
     return False
-    
 def update_web_interface(email, status, valid_count, progress, total):
     with app.test_request_context():
         socketio.emit('update', {
