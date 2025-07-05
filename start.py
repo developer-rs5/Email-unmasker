@@ -73,28 +73,60 @@ def generate_emails(masked):
 def is_valid_email(email):
     try:
         domain = email.split('@')[1]
-        mx_record = dns.resolver.resolve(domain, 'MX')
-        host = str(mx_record[0].exchange)
-
-        server = smtplib.SMTP(host, 25, timeout=5)
-        server.helo()
-        server.mail('check@example.com')
-        code, _ = server.rcpt(email)
-        server.quit()
-        return code == 250
-    except Exception:
+        # Resolve MX records
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        if not mx_records:
+            return False
+            
+        # Try all MX records in priority order
+        for mx in sorted(mx_records, key=lambda x: x.preference):
+            host = str(mx.exchange).rstrip('.')  # Remove trailing dot
+            try:
+                # Connect with timeout
+                with smtplib.SMTP(host, 25, timeout=10) as server:
+                    server.set_debuglevel(0)
+                    
+                    # Send EHLO/HELO
+                    code, _ = server.ehlo()
+                    if code not in (250, 220):
+                        server.helo()
+                    
+                    # Use null sender for verification
+                    code, _ = server.mail('<>')
+                    if code != 250:
+                        continue  # Try next MX server
+                    
+                    # Check recipient
+                    code, msg = server.rcpt(email)
+                    # Accept both 250 and 251 as valid responses
+                    if code in (250, 251):
+                        return True
+            except (smtplib.SMTPException, socket.error, TimeoutError):
+                continue  # Try next server on connection errors
+        
+        return False  # All MX servers failed
+        
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, IndexError):
+        return False  # Invalid domain format or no MX records
+    except dns.resolver.Timeout:
+        return False  # DNS timeout
+    except Exception as e:
+        print(f"Unexpected error verifying {email}: {str(e)}")
         return False
 
 def update_web_interface(email, status, valid_count, progress, total):
-    with app.test_request_context():
-        socketio.emit('update', {
-            'email': email,
-            'status': status,
-            'valid_count': valid_count,
-            'progress': progress,
-            'total': total
-        })
-
+    try:
+        with app.test_request_context():
+            socketio.emit('update', {
+                'email': email,
+                'status': status,
+                'valid_count': valid_count,
+                'progress': progress,
+                'total': total
+            })
+    except Exception as e:
+        print(f"Web interface update failed: {str(e)}")
+        
 def run_verification(masked, threads):
     global results_state
     results_state['running'] = True
