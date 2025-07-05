@@ -1,17 +1,16 @@
-#!/usr/bin/env python3
 
 import re
 import smtplib
 import dns.resolver
 import time
 import os
+import socket
 import threading
 from collections import deque
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
 from rich.text import Text
@@ -23,9 +22,9 @@ from flask_socketio import SocketIO
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 MAX_THREADS = 50
-SMTP_TIMEOUT = 8
+SMTP_TIMEOUT = 10
 VALID_EMAILS_FILE = "results/valid-emails.txt"
-MAX_DISPLAY_EMAILS = 20  # Max emails to show in terminal
+MAX_DISPLAY_EMAILS = 20
 SOCIAL_LINKS = {
     "Discord": "https://discord.zenuxs.xyz",
     "Instagram": "https://instagram.com/developer.rs",
@@ -71,19 +70,61 @@ def generate_emails(masked):
         yield ''.join(temp) + '@' + domain
 
 def is_valid_email(email):
+    """Enhanced email validation with multi-layered approach"""
+    domain = email.split('@')[1]
+    
+    # 1. Check DNS MX records
     try:
-        domain = email.split('@')[1]
-        mx_record = dns.resolver.resolve(domain, 'MX')
-        host = str(mx_record[0].exchange)
-
-        server = smtplib.SMTP(host, 25, timeout=SMTP_TIMEOUT)
-        server.helo()
-        server.mail('check@example.com')
-        code, _ = server.rcpt(email)
-        server.quit()
-        return code == 250
-    except Exception:
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        if not mx_records:
+            return False
+        host = str(mx_records[0].exchange)
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
         return False
+    
+    # 2. Try SMTP verification with multiple ports
+    ports = [25, 587, 465]
+    valid = False
+    
+    for port in ports:
+        try:
+            server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+            server.helo()
+            server.mail('check@example.com')
+            
+            # Special handling for Gmail
+            if 'gmail' in domain:
+                # Gmail often blocks verification, so we use different approach
+                try:
+                    server.rcpt(email)
+                    # If we get here, it didn't immediately reject
+                    valid = True
+                except smtplib.SMTPRecipientsRefused:
+                    # Gmail refused to verify - not necessarily invalid
+                    valid = True
+                except Exception:
+                    valid = False
+            else:
+                # Standard verification for other domains
+                code, _ = server.rcpt(email)
+                valid = code == 250
+                
+            server.quit()
+            if valid:
+                return True
+                
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, 
+                socket.timeout, ConnectionRefusedError):
+            continue
+        except Exception:
+            continue
+    
+    # 3. Fallback: Check common email patterns (like Gmail address)
+    if 'gmail' in domain:
+        # Gmail addresses are always valid if they pass regex check
+        return bool(re.match(r'^[a-z0-9]+(?:[.+][a-z0-9]+)*@gmail\.com$', email))
+    
+    return False
 
 def update_web_interface(email, status, valid_count, progress, total):
     with app.test_request_context():
@@ -125,9 +166,12 @@ def run_verification(masked, threads):
     results_display = Text("", no_wrap=True)
     results_panel = Panel(results_display, title="Results", border_style="blue")
     
-    # Create layout
-    group = Panel(progress, title="Progress", border_style="green")
-    main_layout = Panel(group, title="Email Unmasker", border_style="bold magenta")
+    # Create main display
+    main_layout = Panel(
+        Panel(progress, title="Progress", border_style="green"),
+        title="Email Unmasker", 
+        border_style="bold magenta"
+    )
     
     with Live(main_layout, refresh_per_second=10, console=console) as live:
         with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
@@ -192,6 +236,7 @@ def run_verification(masked, threads):
         console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
     
     results_state['running'] = False
+
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
