@@ -70,28 +70,28 @@ def generate_emails(masked):
             temp[pos] = char
         yield ''.join(temp) + '@' + domain
 
-import dns.resolver
-import smtplib
-import socket
+resolver = dns.resolver.Resolver()
+resolver.nameservers = ['8.8.8.8', '1.1.1.1']  # Google & Cloudflare DNS
 
-def is_really_valid_email(email):
-   
+def is_valid_email(email):
+    # Basic format validation
     if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
         return False
 
     try:
         domain = email.split('@')[1].lower()
 
-        fake_tlds = ('.test', '.invalid', '.example', '.local')
-        if domain.endswith(fake_tlds):
+        # Optional: Skip reserved/fake TLDs
+        if domain.endswith(('.test', '.invalid', '.example', '.local')):
             return False
 
-       
-        mx_records = dns.resolver.resolve(domain, 'MX')
-        return len(mx_records) > 0
+        # Resolve MX records using custom resolver
+        mx_records = resolver.resolve(domain, 'MX')
+        return bool(mx_records)
 
-    except:
+    except Exception as e:
         return False
+
 
 
 def update_web_interface(email, status, valid_count, progress, total):
