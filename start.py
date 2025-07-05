@@ -126,10 +126,10 @@ def update_web_interface(email, status, valid_count, progress, total):
             })
     except Exception as e:
         print(f"Web interface update failed: {str(e)}")
-        
+         
 def run_verification(masked, threads):
     global results_state
-    results_state['running'] = True
+    results_state['running'] = True 
     results_state['emails'] = []
     results_state['valid_emails'] = []
     
