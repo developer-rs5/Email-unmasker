@@ -22,6 +22,9 @@ console = Console()
 app = Flask(__name__)
 VALID_EMAILS_FILE = "results/valid-emails.txt"
 
+rows = []  # For scrollable live view
+MAX_VISIBLE = 20  # Show only last 20 emails in table
+
 def animated_banner():
     fig = Figlet(font='slant')
     title = fig.renderText('EMAIL UNMASKER')
@@ -99,11 +102,16 @@ def run_cli(masked, threads):
                 try:
                     valid = future.result()
                     status = "[green]✅ Valid[/green]" if valid else "[red]❌ Invalid[/red]"
-                    table.add_row(email, status)
+                    rows.append((email, status))
+                    if len(rows) > MAX_VISIBLE:
+                        rows.pop(0)
+                    table.rows.clear()
+                    for em, stat in rows:
+                        table.add_row(em, stat)
                     if valid:
                         valid_emails.add(email)
                 except Exception:
-                    table.add_row(email, "[yellow]⚠️ Error[/yellow]")
+                    rows.append((email, "[yellow]⚠️ Error[/yellow]"))
 
                 checked_count += 1
                 elapsed = time.time() - start_time
@@ -144,7 +152,7 @@ def results():
             data = f.read()
     else:
         data = "No valid emails found."
-    return f"<pre>{data}</pre><br><a href='/'>Back</a>"
+    return f"<pre style='max-height: 500px; overflow-y: scroll;'>{data}</pre><br><a href='/'>Back</a>"
 
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
