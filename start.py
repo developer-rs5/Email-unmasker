@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 
 import re
 import smtplib
@@ -9,9 +8,11 @@ import threading
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
+from pyfiglet import Figlet
 import argparse
 from flask import Flask, render_template_string, request, redirect, url_for
 from flask_socketio import SocketIO
@@ -21,7 +22,7 @@ CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 MAX_THREADS = 50
 SMTP_TIMEOUT = 8
 VALID_EMAILS_FILE = "results/valid-emails.txt"
-MAX_DISPLAY_EMAILS = 20
+MAX_DISPLAY_EMAILS = 20  # Max emails to show in terminal
 SOCIAL_LINKS = {
     "Discord": "https://discord.zenuxs.xyz",
     "Instagram": "https://instagram.com/developer.rs",
@@ -42,15 +43,12 @@ results_state = {
 }
 
 def animated_banner():
-    try:
-        from pyfiglet import Figlet
-        fig = Figlet(font='slant')
-        title = fig.renderText('EMAIL UNMASKER')
-        console.print(f"[bold cyan]{title}[/bold cyan]")
-    except ImportError:
-        console.print("[bold cyan]EMAIL UNMASKER[/bold cyan]")
-    
+    fig = Figlet(font='slant')
+    title = fig.renderText('EMAIL UNMASKER')
+    console.print(f"[bold cyan]{title}[/bold cyan]")
     console.print("[bold yellow]Developed by: [green]developer.rs[/green][/bold yellow]")
+    
+    # Display social links
     console.print("\n[bold]Connect with us:[/bold]")
     for platform, url in SOCIAL_LINKS.items():
         console.print(f"[blue]{platform}:[/blue] [link={url}]{url}[/link]")
@@ -85,23 +83,20 @@ def is_valid_email(email):
         return False
 
 def update_web_interface(email, status, valid_count, progress, total):
-    socketio.emit('update', {
-        'email': email,
-        'status': status,
-        'valid_count': valid_count,
-        'progress': progress,
-        'total': total
-    })
+    with app.test_request_context():
+        socketio.emit('update', {
+            'email': email,
+            'status': status,
+            'valid_count': valid_count,
+            'progress': progress,
+            'total': total
+        })
 
 def run_verification(masked, threads):
     global results_state
-    results_state = {
-        'emails': [],
-        'valid_emails': [],
-        'progress': 0,
-        'total': 0,
-        'running': True
-    }
+    results_state['running'] = True
+    results_state['emails'] = []
+    results_state['valid_emails'] = []
     
     os.makedirs("results", exist_ok=True)
     emails = list(generate_emails(masked))
@@ -111,6 +106,7 @@ def run_verification(masked, threads):
     start_time = time.time()
     checked_count = 0
     valid_emails = set()
+    seen_emails = set()
 
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -123,8 +119,6 @@ def run_verification(masked, threads):
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Email", style="cyan")
     table.add_column("Status")
-    
-    display_rows = []
 
     with Live(table, refresh_per_second=10, console=console):
         with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
@@ -132,20 +126,20 @@ def run_verification(masked, threads):
             
             for future in as_completed(futures):
                 email = futures[future]
+                if email in seen_emails:
+                    continue
+                seen_emails.add(email)
+
                 try:
                     valid = future.result()
                     status = "✅ Valid" if valid else "❌ Invalid"
                     
                     # Update terminal display
-                    display_rows.append((email, status))
-                    if len(display_rows) > MAX_DISPLAY_EMAILS:
-                        display_rows.pop(0)
+                    if len(table.rows) >= MAX_DISPLAY_EMAILS:
+                        table.rows.pop(0)
+                    table.add_row(email, status)
                     
-                    table.rows.clear()
-                    for em, stat in display_rows:
-                        table.add_row(em, stat)
-                    
-                    # Update state
+                    # Update web interface
                     if valid:
                         valid_emails.add(email)
                         results_state['valid_emails'].append(email)
@@ -153,9 +147,7 @@ def run_verification(masked, threads):
                     results_state['emails'].append({'email': email, 'status': status})
                     checked_count += 1
                     progress_percent = int((checked_count / total) * 100)
-                    results_state['progress'] = progress_percent
                     
-                    # Update web interface
                     update_web_interface(
                         email=email,
                         status=status,
@@ -170,15 +162,10 @@ def run_verification(masked, threads):
                         eta = int((total - checked_count) * avg_time)
                         progress.update(task, advance=1, description=f"ETA: {eta}s")
 
-                except Exception as e:
-                    display_rows.append((email, "⚠️ Error"))
-                    if len(display_rows) > MAX_DISPLAY_EMAILS:
-                        display_rows.pop(0)
-                    
-                    table.rows.clear()
-                    for em, stat in display_rows:
-                        table.add_row(em, stat)
-                    
+                except Exception:
+                    if len(table.rows) >= MAX_DISPLAY_EMAILS:
+                        table.rows.pop(0)
+                    table.add_row(email, "⚠️ Error")
                     results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
                     update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
 
