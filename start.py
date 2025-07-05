@@ -137,12 +137,28 @@ def index():
         run_cli(masked, threads)
         return redirect(url_for('results'))
     return render_template_string('''
-        <h2>Email Unmasker Web</h2>
-        <form method="post">
-            Masked Email: <input name="masked" required><br>
-            Threads: <input name="threads" type="number" value="50" required><br>
-            <button type="submit">Start</button>
-        </form>
+        <html>
+        <head>
+            <title>Email Unmasker</title>
+            <style>
+                body { font-family: Arial, sans-serif; background: #1a1a1a; color: #f0f0f0; text-align: center; }
+                input, button { padding: 10px; margin: 10px; font-size: 1em; }
+                button { background-color: #28a745; color: white; border: none; cursor: pointer; }
+                h2 { color: #00ffcc; }
+            </style>
+        </head>
+        <body>
+            <h2>🔍 Email Unmasker Web</h2>
+            <form method="post">
+                <label>Masked Email:</label><br>
+                <input name="masked" required><br>
+                <label>Threads:</label><br>
+                <input name="threads" type="number" value="50" required><br>
+                <button type="submit">Start</button>
+            </form>
+            <p>Developed by <b>developer.rs</b> | CLI + Web | SMTP-based email validation</p>
+        </body>
+        </html>
     ''')
 
 @app.route('/results')
@@ -152,7 +168,23 @@ def results():
             data = f.read()
     else:
         data = "No valid emails found."
-    return f"<pre style='max-height: 500px; overflow-y: scroll;'>{data}</pre><br><a href='/'>Back</a>"
+    return render_template_string('''
+        <html>
+        <head>
+            <title>Results</title>
+            <style>
+                body { background: #111; color: #eee; font-family: monospace; padding: 20px; }
+                pre { max-height: 500px; overflow-y: scroll; background: #222; padding: 10px; border: 1px solid #444; }
+                a { color: #00ffcc; }
+            </style>
+        </head>
+        <body>
+            <h2>✅ Valid Emails</h2>
+            <pre>{{data}}</pre>
+            <a href="/">← Back</a>
+        </body>
+        </html>
+    ''', data=data)
 
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
