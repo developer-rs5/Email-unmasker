@@ -77,29 +77,23 @@ import socket
 def is_valid_email(email):
     try:
         domain = email.split('@')[1]
+        dns.resolver.resolve(domain, 'A')  # Pre-check
 
-        # Quick pre-check to avoid slow SMTP on invalid domains
-        try:
-            dns.resolver.resolve(domain, 'A')
-        except:
-            return False
-
-        # Only try the top-priority MX server
         mx_records = sorted(dns.resolver.resolve(domain, 'MX'), key=lambda x: x.preference)[:1]
         if not mx_records:
             return False
 
         host = str(mx_records[0].exchange).rstrip('.')
 
-        with smtplib.SMTP(host, 25, timeout=1) as server:
-            server.set_debuglevel(0)
+        with smtplib.SMTP(host, 587, timeout=3) as server:
+            server.starttls()
             server.ehlo()
-            server.mail('<>')
+            server.mail('verify@example.com')  # Fake sender
             code, _ = server.rcpt(email)
             return code in (250, 251)
 
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, IndexError, dns.resolver.Timeout,
-            smtplib.SMTPException, socket.error, TimeoutError):
+    except Exception as e:
+        print(f"Error: {e}")  # For debug
         return False
 
 
