@@ -1,3 +1,4 @@
+
 import re
 import smtplib
 import dns.resolver
@@ -5,7 +6,7 @@ import time
 import os
 import socket
 import threading
-from collections import deque, defaultdict
+from collections import deque
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
@@ -44,10 +45,6 @@ results_state = {
     'running': False
 }
 
-# MX Record Cache with thread safety
-mx_cache = {}
-cache_lock = threading.Lock()
-
 def animated_banner():
     fig = Figlet(font='slant')
     title = fig.renderText('EMAIL UNMASKER')
@@ -73,62 +70,48 @@ def generate_emails(masked):
             temp[pos] = char
         yield ''.join(temp) + '@' + domain
 
-# Optimized MX record lookup with caching
-def get_mx_records(domain):
-    with cache_lock:
-        if domain in mx_cache:
-            return mx_cache[domain]
-        
-        try:
-            mx_records = dns.resolver.resolve(domain, 'MX')
-            sorted_records = sorted(mx_records, key=lambda x: x.preference)
-            mx_list = [str(r.exchange).rstrip('.') for r in sorted_records]
-            mx_cache[domain] = mx_list
-            return mx_list
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-            mx_cache[domain] = []
-            return []
-        except dns.resolver.Timeout:
-            return []
-        except Exception as e:
-            print(f"DNS error for {domain}: {str(e)}")
-            return []
-
-# Optimized email verification
-def verify_email_with_mx(email, mx_host):
-    try:
-        with smtplib.SMTP(mx_host, 25, timeout=SMTP_TIMEOUT) as server:
-            server.set_debuglevel(0)
-            server.ehlo()
-            server.mail('<>')
-            code, _ = server.rcpt(email)
-            return code in (250, 251)
-    except (smtplib.SMTPException, socket.error):
-        return False
-    except Exception as e:
-        print(f"SMTP error for {email}@{mx_host}: {str(e)}")
-        return False
-
 def is_valid_email(email):
     try:
-        parts = email.split('@')
-        if len(parts) != 2:
+        domain = email.split('@')[1]
+        # Resolve MX records
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        if not mx_records:
             return False
             
-        domain = parts[1]
-        mx_hosts = get_mx_records(domain)
-        if not mx_hosts:
-            return False
-            
-        # Try up to 2 highest priority MX servers
-        for host in mx_hosts[:2]:
-            if verify_email_with_mx(email, host):
-                return True
-                
-        return False
+        # Try all MX records in priority order
+        for mx in sorted(mx_records, key=lambda x: x.preference):
+            host = str(mx.exchange).rstrip('.')  # Remove trailing dot
+            try:
+                # Connect with timeout
+                with smtplib.SMTP(host, 25, timeout=1) as server:
+                    server.set_debuglevel(0)
+                    
+                    # Send EHLO/HELO
+                    code, _ = server.ehlo()
+                    if code not in (250, 220):
+                        server.helo()
+                    
+                    # Use null sender for verification
+                    code, _ = server.mail('<>')
+                    if code != 250:
+                        continue  # Try next MX server
+                    
+                    # Check recipient
+                    code, msg = server.rcpt(email)
+                    # Accept both 250 and 251 as valid responses
+                    if code in (250, 251):
+                        return True
+            except (smtplib.SMTPException, socket.error, TimeoutError):
+                continue  # Try next server on connection errors
         
+        return False  # All MX servers failed
+        
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, IndexError):
+        return False  # Invalid domain format or no MX records
+    except dns.resolver.Timeout:
+        return False  # DNS timeout
     except Exception as e:
-        print(f"Validation error for {email}: {str(e)}")
+        print(f"Unexpected error verifying {email}: {str(e)}")
         return False
 
 def update_web_interface(email, status, valid_count, progress, total):
@@ -151,30 +134,9 @@ def run_verification(masked, threads):
     results_state['valid_emails'] = []
     
     os.makedirs("results", exist_ok=True)
-    
-    # Pre-resolve domains
-    domain = masked.split('@')[1]
-    console.print(f"[yellow]Pre-resolving MX records for {domain}...[/yellow]")
-    mx_hosts = get_mx_records(domain)
-    
-    if not mx_hosts:
-        console.print(f"[red]No MX records found for {domain}. Aborting verification.[/red]")
-        results_state['running'] = False
-        return
-        
-    console.print(f"[green]Found {len(mx_hosts)} MX records for {domain}[/green]")
-    
-    # Generate emails and get total count
-    prefix = masked.split('@')[0]
-    num_stars = prefix.count('*')
-    total = len(CHARSET) ** num_stars
+    emails = list(generate_emails(masked))
+    total = len(emails)
     results_state['total'] = total
-    
-    if total > 1000000:  # 1 million
-        console.print(f"[red]Warning: {total} emails to verify - this may take significant time[/red]")
-        if console.input("Continue? (y/n): ").strip().lower() != 'y':
-            results_state['running'] = False
-            return
     
     start_time = time.time()
     checked_count = 0
@@ -204,70 +166,56 @@ def run_verification(masked, threads):
     
     with Live(main_layout, refresh_per_second=10, console=console) as live:
         with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
-            # Submit tasks in chunks to avoid memory overload
-            batch_size = 10000
-            email_gen = generate_emails(masked)
-            futures = {}
+            futures = {executor.submit(is_valid_email, email): email for email in emails}
             
-            while True:
-                batch = [next(email_gen, None) for _ in range(batch_size)]
-                if not any(batch):
-                    break
+            for future in as_completed(futures):
+                email = futures[future]
+                if email in seen_emails: 
+                    continue
+                seen_emails.add(email)
+
+                try:
+                    valid = future.result()
+                    status = "✅ Valid" if valid else "❌ Invalid"
+                    color = "green" if valid else "red"
                     
-                for email in batch:
-                    if email is None:
-                        continue
-                    future = executor.submit(is_valid_email, email)
-                    futures[future] = email
+                    # Update results display
+                    last_results.appendleft(f"[{color}]{email} - {status}[/]")
+                    results_display = Text("\n".join(last_results), no_wrap=True)
+                    results_panel.renderable = results_display
                     
-                for future in as_completed(futures.copy()):
-                    email = futures.pop(future)
-                    if email in seen_emails:
-                        continue
-                    seen_emails.add(email)
+                    # Update web interface
+                    if valid:
+                        valid_emails.add(email)
+                        results_state['valid_emails'].append(email)
+                    
+                    results_state['emails'].append({'email': email, 'status': status})
+                    checked_count += 1
+                    progress_percent = int((checked_count / total) * 100)
+                    
+                    update_web_interface(
+                        email=email,
+                        status=status,
+                        valid_count=len(valid_emails),
+                        progress=progress_percent,
+                        total=total
+                    )
 
-                    try:
-                        valid = future.result()
-                        status = "✅ Valid" if valid else "❌ Invalid"
-                        color = "green" if valid else "red"
-                        
-                        # Update results display
-                        last_results.appendleft(f"[{color}]{email} - {status}[/]")
-                        results_display = Text("\n".join(last_results), no_wrap=True)
-                        results_panel.renderable = results_display
-                        
-                        # Update web interface
-                        if valid:
-                            valid_emails.add(email)
-                            results_state['valid_emails'].append(email)
-                        
-                        results_state['emails'].append({'email': email, 'status': status})
-                        checked_count += 1
-                        progress_percent = int((checked_count / total) * 100)
-                        
-                        update_web_interface(
-                            email=email,
-                            status=status,
-                            valid_count=len(valid_emails),
-                            progress=progress_percent,
-                            total=total
-                        )
+                    # Update progress
+                    progress.update(task, advance=1)
+                    
+                    # Refresh display
+                    live.update(main_layout)
 
-                        # Update progress
-                        progress.update(task, advance=1)
-                        
-                        # Refresh display
-                        live.update(main_layout)
-
-                    except Exception as e:
-                        last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
-                        results_display = Text("\n".join(last_results), no_wrap=True)
-                        results_panel.renderable = results_display
-                        results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
-                        progress_percent = int((checked_count / total) * 100)
-                        update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
-                        progress.update(task, advance=1)
-                        live.update(main_layout)
+                except Exception as e:
+                    last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
+                    results_display = Text("\n".join(last_results), no_wrap=True)
+                    results_panel.renderable = results_display
+                    results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
+                    progress_percent = int((checked_count / total) * 100)
+                    update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
+                    progress.update(task, advance=1)
+                    live.update(main_layout)
 
     if valid_emails:
         with open(VALID_EMAILS_FILE, "w") as f:
@@ -278,8 +226,6 @@ def run_verification(masked, threads):
     else:
         console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
     
-    elapsed = time.time() - start_time
-    console.print(f"⏱️ Verification completed in {elapsed:.2f} seconds")
     results_state['running'] = False
 
 
@@ -309,22 +255,17 @@ def index():
                 h2 { color: #00ffcc; }
                 .social-links { margin-top: 20px; }
                 .social-links a { margin: 0 10px; color: #00ccff; text-decoration: none; }
-                .warning { color: #ff9900; margin: 10px 0; }
             </style>
         </head>
         <body>
             <h2>🔍 Email Unmasker Web</h2>
             <form method="post">
                 <label>Masked Email:</label><br>
-                <input name="masked" placeholder="r****r@example.com" required><br>
+                <input name="masked" placeholder="r****r@gmail.com" required><br>
                 <label>Threads:</label><br>
-                <input name="threads" type="number" value="50" min="1" max="100" required><br>
+                <input name="threads" type="number" value="20" min="1" max="100" required><br>
                 <button type="submit">Start</button>
             </form>
-            
-            <div class="warning">
-                <p>Note: Verification may take time for large combinations</p>
-            </div>
             
             <div class="social-links">
                 <p>Connect with us:</p>
@@ -353,19 +294,10 @@ def live_results():
                 .progress-container { width: 100%; background-color: #333; margin: 10px 0; }
                 .progress-bar { height: 20px; background-color: #28a745; width: 0%; }
                 .stats { margin: 10px 0; }
-                .timer { margin-top: 10px; color: #aaa; }
             </style>
             <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
             <script>
                 const socket = io();
-                let startTime = Date.now();
-                
-                function updateTimer() {
-                    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                    document.getElementById('timer').textContent = `Elapsed: ${elapsed}s`;
-                }
-                
-                setInterval(updateTimer, 1000);
                 
                 socket.on('update', function(data) {
                     // Update results list
@@ -394,7 +326,6 @@ def live_results():
             <div class="stats">
                 <div>Valid Emails: <span id="valid-count">0</span></div>
                 <div>Progress: <span id="checked-count">0</span>/<span id="total-count">0</span></div>
-                <div class="timer" id="timer">Elapsed: 0s</div>
             </div>
             
             <div class="progress-container">
@@ -411,8 +342,8 @@ def live_results():
 
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
-    parser.add_argument('-e', '--email', help='Masked email (e.g. r****r@example.com)')
-    parser.add_argument('-t', '--threads', help='Threads count (default: 50)', type=int, default=50)
+    parser.add_argument('-e', '--email', help='Masked email (e.g. r****r@gmail.com)')
+    parser.add_argument('-t', '--threads', help='Threads count (default: 20)', type=int, default=20)
     parser.add_argument('--web', help='Launch web interface', action='store_true')
     args = parser.parse_args()
 
@@ -426,17 +357,17 @@ def cli_entry():
     else:
         animated_banner()
         while True:
-            masked = console.input("Enter masked email (e.g. r******s@example.com): ").strip().lower()
+            masked = console.input("Enter masked email (e.g. r******s@gmail.com): ").strip().lower()
             if re.match(r'^[a-z0-9.*]+@[a-z]+\.[a-z]+$', masked):
                 break
             console.print("[red]❌ Invalid email format[/red]")
         
         while True:
             try:
-                threads = int(console.input("How many threads (recommended 50-100)?: "))
-                if 1 <= threads <= 500:
+                threads = int(console.input("How many threads (requests per second)? (e.g. 50): "))
+                if threads >= 1:
                     break
-                console.print("[red]❌ Thread count must be between 1-500[/red]")
+                console.print("[red]❌ Thread count must be at least 1[/red]")
             except ValueError:
                 console.print("[red]❌ Invalid number[/red]")
         
