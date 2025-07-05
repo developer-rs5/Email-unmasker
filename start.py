@@ -1,21 +1,22 @@
-
 import re
 import smtplib
 import dns.resolver
 import time
 import os
 import threading
+from collections import deque
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
+from rich.text import Text
 from pyfiglet import Figlet
 import argparse
 from flask import Flask, render_template_string, request, redirect, url_for
 from flask_socketio import SocketIO
+from rich.layout import Layout
 
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -108,6 +109,7 @@ def run_verification(masked, threads):
     valid_emails = set()
     seen_emails = set()
 
+    # Create progress bar
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -115,12 +117,19 @@ def run_verification(masked, threads):
         TimeRemainingColumn(),
     )
     task = progress.add_task("Checking...", total=total)
-
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Email", style="cyan")
-    table.add_column("Status")
-
-    with Live(table, refresh_per_second=10, console=console):
+    
+    # Create results display
+    last_results = deque(maxlen=MAX_DISPLAY_EMAILS)
+    results_display = Panel("", title="Results", border_style="blue")
+    
+    # Create layout
+    layout = Layout()
+    layout.split(
+        Layout(progress, name="progress", size=3),
+        Layout(results_display, name="results")
+    )
+    
+    with Live(layout, refresh_per_second=10, console=console) as live:
         with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
             futures = {executor.submit(is_valid_email, email): email for email in emails}
             
@@ -134,10 +143,10 @@ def run_verification(masked, threads):
                     valid = future.result()
                     status = "✅ Valid" if valid else "❌ Invalid"
                     
-                    # Update terminal display
-                    if len(table.rows) >= MAX_DISPLAY_EMAILS:
-                        table.rows.pop(0)
-                    table.add_row(email, status)
+                    # Update results display
+                    color = "green" if valid else "red"
+                    last_results.appendleft(f"[{color}]{email} - {status}[/]")
+                    results_display.renderable = Text("\n".join(last_results), no_wrap=True)
                     
                     # Update web interface
                     if valid:
@@ -156,18 +165,18 @@ def run_verification(masked, threads):
                         total=total
                     )
 
-                    elapsed = time.time() - start_time
-                    if checked_count > 0:
-                        avg_time = elapsed / checked_count
-                        eta = int((total - checked_count) * avg_time)
-                        progress.update(task, advance=1, description=f"ETA: {eta}s")
+                    # Update progress
+                    progress.update(task, advance=1)
+                    live.refresh()
 
-                except Exception:
-                    if len(table.rows) >= MAX_DISPLAY_EMAILS:
-                        table.rows.pop(0)
-                    table.add_row(email, "⚠️ Error")
+                except Exception as e:
+                    last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
+                    results_display.renderable = Text("\n".join(last_results), no_wrap=True)
                     results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
+                    progress_percent = int((checked_count / total) * 100)
                     update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
+                    progress.update(task, advance=1)
+                    live.refresh()
 
     if valid_emails:
         with open(VALID_EMAILS_FILE, "w") as f:
