@@ -21,6 +21,6 @@
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/your-username/email-unmasker.git
-cd email-unmasker
+git clone https://github.com/developer-rs5/Email-unmasker.git
+cd Email-unmasker
 pip install -r requirements.txt
