@@ -77,23 +77,9 @@ import socket
 def is_valid_email(email):
     try:
         domain = email.split('@')[1]
-        dns.resolver.resolve(domain, 'A')  # Pre-check
-
-        mx_records = sorted(dns.resolver.resolve(domain, 'MX'), key=lambda x: x.preference)[:1]
-        if not mx_records:
-            return False
-
-        host = str(mx_records[0].exchange).rstrip('.')
-
-        with smtplib.SMTP(host, 587, timeout=3) as server:
-            server.starttls()
-            server.ehlo()
-            server.mail('verify@example.com')  # Fake sender
-            code, _ = server.rcpt(email)
-            return code in (250, 251)
-
-    except Exception as e:
-        print(f"Error: {e}")  # For debug
+        mx = dns.resolver.resolve(domain, 'MX')
+        return True if mx else False
+    except:
         return False
 
 
