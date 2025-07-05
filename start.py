@@ -81,6 +81,8 @@ def run_cli(masked, threads):
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Email", style="cyan")
     table.add_column("Status")
+    table.add_row("Waiting...", "⏳")
+
 
     layout = Layout()
     layout.split(
