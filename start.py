@@ -1,11 +1,10 @@
-# email_unmasker.py
-
 import re
 import smtplib
 import dns.resolver
 import time
 import argparse
 import os
+import socket
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template_string, request, redirect, url_for
@@ -47,16 +46,52 @@ def generate_emails(masked):
 def is_valid_email(email):
     try:
         domain = email.split('@')[1]
-        mx_record = dns.resolver.resolve(domain, 'MX')
-        host = str(mx_record[0].exchange)
+        
+        # DNS MX Record Check
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            if not mx_records:
+                return False
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, 
+                dns.resolver.NoNameservers, dns.resolver.Timeout):
+            return False
 
-        server = smtplib.SMTP(host, 25, timeout=5)
-        server.helo()
-        server.mail('check@example.com')
-        code, _ = server.rcpt(email)
-        server.quit()
-        return code == 250
-    except Exception:
+        # Try each MX record
+        for mx in mx_records:
+            host = str(mx.exchange).rstrip('.')
+            try:
+                # SMTP Verification
+                with smtplib.SMTP(host, 25, timeout=10) as server:
+                    server.set_debuglevel(0)
+                    
+                    # Some servers require EHLO instead of HELO
+                    try:
+                        server.ehlo()
+                    except smtplib.SMTPHeloError:
+                        server.helo()
+                    
+                    # Verify sender
+                    try:
+                        server.mail('verify@example.com')
+                    except smtplib.SMTPResponseException:
+                        continue
+                    
+                    # Verify recipient
+                    code, _ = server.rcpt(email)
+                    if code == 250:
+                        server.quit()
+                        return True
+                    
+                    server.quit()
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
+                   smtplib.SMTPResponseException, socket.timeout,
+                   ConnectionRefusedError, TimeoutError,
+                   smtplib.SMTPNotSupportedError, smtplib.SMTPAuthenticationError):
+                continue
+        
+        return False
+    except Exception as e:
+        console.print(f"[yellow]Error checking {email}: {str(e)}[/yellow]")
         return False
 
 def run_cli(masked, threads):
@@ -81,8 +116,7 @@ def run_cli(masked, threads):
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Email", style="cyan")
     table.add_column("Status")
-    table.add_row("Waiting...", "⏳")
-
+    table.add_row("Starting verification...", "⏳")
 
     layout = Layout()
     layout.split(
@@ -112,15 +146,14 @@ def run_cli(masked, threads):
                         table.add_row(em, stat)
                     if valid:
                         valid_emails.add(email)
-                except Exception:
-                    rows.append((email, "[yellow]⚠️ Error[/yellow]"))
+                        console.print(f"[green]Found valid email: {email}[/green]")
+                except Exception as e:
+                    rows.append((email, f"[yellow]⚠️ Error ({str(e)[:30]})[/yellow]"))
+                    console.print(f"[red]Error processing {email}: {str(e)}[/red]")
 
                 checked_count += 1
                 elapsed = time.time() - start_time
-                if checked_count > 0:
-                    avg_time = elapsed / checked_count
-                    eta = int((total - checked_count) * avg_time)
-                    progress.update(task, advance=1, description=f"ETA: {eta}s")
+                progress.update(task, advance=1, description=f"Checked {checked_count}/{total}")
 
     if valid_emails:
         with open(VALID_EMAILS_FILE, "w") as f:
@@ -128,6 +161,7 @@ def run_cli(masked, threads):
                 f.write(email + "\n")
         box = "\n".join(sorted(valid_emails))
         console.print(Panel(box, title="✅ Valid Emails Found", border_style="green"))
+        console.print(f"[green]Results saved to {VALID_EMAILS_FILE}[/green]")
     else:
         console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
 
@@ -153,9 +187,9 @@ def index():
             <h2>🔍 Email Unmasker Web</h2>
             <form method="post">
                 <label>Masked Email:</label><br>
-                <input name="masked" required><br>
+                <input name="masked" placeholder="r****r@gmail.com" required><br>
                 <label>Threads:</label><br>
-                <input name="threads" type="number" value="50" required><br>
+                <input name="threads" type="number" value="20" min="1" max="100" required><br>
                 <button type="submit">Start</button>
             </form>
             <p>Developed by <b>developer.rs</b> | CLI + Web | SMTP-based email validation</p>
@@ -191,19 +225,35 @@ def results():
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
     parser.add_argument('-e', '--email', help='Masked email (e.g. r****r@gmail.com)')
-    parser.add_argument('-t', '--threads', help='Threads per second', type=int, default=50)
+    parser.add_argument('-t', '--threads', help='Threads count (default: 20)', type=int, default=20)
     parser.add_argument('--web', help='Launch web interface', action='store_true')
     args = parser.parse_args()
 
     if args.web:
-        app.run(debug=True, port=5000)
+        app.run(host='0.0.0.0', port=5000, debug=False)
     elif args.email:
-        run_cli(args.email, args.threads)
+        if not re.match(r'^[a-zA-Z0-9*]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', args.email):
+            console.print("[red]Error: Invalid email format. Use pattern like r****r@gmail.com[/red]")
+            return
+        run_cli(args.email.strip().lower(), args.threads)
     else:
         animated_banner()
-        email = console.input("Enter masked email (e.g. r******s@gmail.com): ")
-        threads = int(console.input("How many threads (requests per second)? (e.g. 50): "))
-        run_cli(email.strip().lower(), threads)
+        while True:
+            email = console.input("Enter masked email (e.g. r******s@gmail.com): ").strip().lower()
+            if re.match(r'^[a-zA-Z0-9*]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+                break
+            console.print("[red]Invalid format. Please include @ and domain (e.g. r****r@gmail.com)[/red]")
+        
+        while True:
+            try:
+                threads = int(console.input("How many threads (1-100)? (default 20): ") or 20)
+                if 1 <= threads <= 100:
+                    break
+                console.print("[red]Please enter a number between 1 and 100[/red]")
+            except ValueError:
+                console.print("[red]Please enter a valid number[/red]")
+        
+        run_cli(email, threads)
 
 if __name__ == "__main__":
     cli_entry()
