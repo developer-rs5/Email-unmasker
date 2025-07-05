@@ -12,9 +12,9 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
-from pyfiglet import Figlet
 import argparse
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for
+from flask_socketio import SocketIO
 
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -30,6 +30,7 @@ SOCIAL_LINKS = {
 
 console = Console()
 app = Flask(__name__)
+socketio = SocketIO(app)
 
 # Shared state for web interface
 results_state = {
@@ -41,9 +42,14 @@ results_state = {
 }
 
 def animated_banner():
-    fig = Figlet(font='slant')
-    title = fig.renderText('EMAIL UNMASKER')
-    console.print(f"[bold cyan]{title}[/bold cyan]")
+    try:
+        from pyfiglet import Figlet
+        fig = Figlet(font='slant')
+        title = fig.renderText('EMAIL UNMASKER')
+        console.print(f"[bold cyan]{title}[/bold cyan]")
+    except ImportError:
+        console.print("[bold cyan]EMAIL UNMASKER[/bold cyan]")
+    
     console.print("[bold yellow]Developed by: [green]developer.rs[/green][/bold yellow]")
     console.print("\n[bold]Connect with us:[/bold]")
     for platform, url in SOCIAL_LINKS.items():
@@ -78,6 +84,15 @@ def is_valid_email(email):
     except Exception:
         return False
 
+def update_web_interface(email, status, valid_count, progress, total):
+    socketio.emit('update', {
+        'email': email,
+        'status': status,
+        'valid_count': valid_count,
+        'progress': progress,
+        'total': total
+    })
+
 def run_verification(masked, threads):
     global results_state
     results_state = {
@@ -97,39 +112,102 @@ def run_verification(masked, threads):
     checked_count = 0
     valid_emails = set()
 
-    with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
-        futures = {executor.submit(is_valid_email, email): email for email in emails}
-        
-        for future in as_completed(futures):
-            email = futures[future]
-            try:
-                valid = future.result()
-                status = "✅ Valid" if valid else "❌ Invalid"
-                
-                if valid:
-                    valid_emails.add(email)
-                    results_state['valid_emails'].append(email)
-                
-                results_state['emails'].append({'email': email, 'status': status})
-                checked_count += 1
-                progress_percent = int((checked_count / total) * 100)
-                results_state['progress'] = progress_percent
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeRemainingColumn(),
+    )
+    task = progress.add_task("Checking...", total=total)
 
-            except Exception:
-                results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Email", style="cyan")
+    table.add_column("Status")
+    
+    display_rows = []
+
+    with Live(table, refresh_per_second=10, console=console):
+        with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
+            futures = {executor.submit(is_valid_email, email): email for email in emails}
+            
+            for future in as_completed(futures):
+                email = futures[future]
+                try:
+                    valid = future.result()
+                    status = "✅ Valid" if valid else "❌ Invalid"
+                    
+                    # Update terminal display
+                    display_rows.append((email, status))
+                    if len(display_rows) > MAX_DISPLAY_EMAILS:
+                        display_rows.pop(0)
+                    
+                    table.rows.clear()
+                    for em, stat in display_rows:
+                        table.add_row(em, stat)
+                    
+                    # Update state
+                    if valid:
+                        valid_emails.add(email)
+                        results_state['valid_emails'].append(email)
+                    
+                    results_state['emails'].append({'email': email, 'status': status})
+                    checked_count += 1
+                    progress_percent = int((checked_count / total) * 100)
+                    results_state['progress'] = progress_percent
+                    
+                    # Update web interface
+                    update_web_interface(
+                        email=email,
+                        status=status,
+                        valid_count=len(valid_emails),
+                        progress=progress_percent,
+                        total=total
+                    )
+
+                    elapsed = time.time() - start_time
+                    if checked_count > 0:
+                        avg_time = elapsed / checked_count
+                        eta = int((total - checked_count) * avg_time)
+                        progress.update(task, advance=1, description=f"ETA: {eta}s")
+
+                except Exception as e:
+                    display_rows.append((email, "⚠️ Error"))
+                    if len(display_rows) > MAX_DISPLAY_EMAILS:
+                        display_rows.pop(0)
+                    
+                    table.rows.clear()
+                    for em, stat in display_rows:
+                        table.add_row(em, stat)
+                    
+                    results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
+                    update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
 
     if valid_emails:
         with open(VALID_EMAILS_FILE, "w") as f:
             for email in sorted(valid_emails):
                 f.write(email + "\n")
-        console.print(Panel("\n".join(sorted(valid_emails)), title="✅ Valid Emails Found", border_style="green"))
+        box = "\n".join(sorted(valid_emails))
+        console.print(Panel(box, title="✅ Valid Emails Found", border_style="green"))
     else:
         console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
     
     results_state['running'] = False
 
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def index():
+    if request.method == 'POST':
+        masked = request.form['masked']
+        threads = int(request.form['threads'])
+        
+        # Start verification in a separate thread
+        threading.Thread(
+            target=run_verification,
+            args=(masked, threads),
+            daemon=True
+        ).start()
+        
+        return redirect(url_for('live_results'))
+    
     return render_template_string('''
         <html>
         <head>
@@ -145,7 +223,7 @@ def index():
         </head>
         <body>
             <h2>🔍 Email Unmasker Web</h2>
-            <form method="post" action="/start">
+            <form method="post">
                 <label>Masked Email:</label><br>
                 <input name="masked" placeholder="r****r@gmail.com" required><br>
                 <label>Threads:</label><br>
@@ -165,25 +243,12 @@ def index():
         </html>
     ''')
 
-@app.route('/start', methods=['POST'])
-def start_verification():
-    masked = request.form['masked']
-    threads = int(request.form['threads'])
-    
-    threading.Thread(
-        target=run_verification,
-        args=(masked, threads),
-        daemon=True
-    ).start()
-    
-    return redirect(url_for('results'))
-
-@app.route('/results')
-def results():
+@app.route('/live-results')
+def live_results():
     return render_template_string('''
         <html>
         <head>
-            <title>Results</title>
+            <title>Live Results</title>
             <style>
                 body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
                 #results { height: 70vh; overflow-y: auto; border: 1px solid #444; padding: 10px; }
@@ -194,44 +259,33 @@ def results():
                 .progress-bar { height: 20px; background-color: #28a745; width: 0%; }
                 .stats { margin: 10px 0; }
             </style>
+            <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
             <script>
-                function fetchUpdates() {
-                    fetch('/get-updates')
-                        .then(response => response.json())
-                        .then(data => {
-                            // Update progress
-                            document.getElementById('progress-bar').style.width = `${data.progress}%`;
-                            document.getElementById('progress-text').textContent = `${data.progress}%`;
-                            
-                            // Update stats
-                            document.getElementById('valid-count').textContent = data.valid_count;
-                            document.getElementById('checked-count').textContent = Math.round(data.total * (data.progress/100));
-                            document.getElementById('total-count').textContent = data.total;
-                            
-                            // Update results
-                            const resultsDiv = document.getElementById('results');
-                            resultsDiv.innerHTML = '';
-                            data.emails.forEach(item => {
-                                const entry = document.createElement('div');
-                                entry.className = item.status.includes('Valid') ? 'valid' : 
-                                                  item.status.includes('Invalid') ? 'invalid' : 'error';
-                                entry.textContent = `${item.email} - ${item.status}`;
-                                resultsDiv.appendChild(entry);
-                            });
-                            resultsDiv.scrollTop = resultsDiv.scrollHeight;
-                            
-                            // Continue polling if still running
-                            if (data.progress < 100) {
-                                setTimeout(fetchUpdates, 1000);
-                            }
-                        });
-                }
-                // Start polling when page loads
-                window.onload = fetchUpdates;
+                const socket = io();
+                
+                socket.on('update', function(data) {
+                    // Update results list
+                    const resultsDiv = document.getElementById('results');
+                    const entry = document.createElement('div');
+                    entry.className = data.status.includes('Valid') ? 'valid' : 
+                                      data.status.includes('Invalid') ? 'invalid' : 'error';
+                    entry.textContent = `${data.email} - ${data.status}`;
+                    resultsDiv.appendChild(entry);
+                    resultsDiv.scrollTop = resultsDiv.scrollHeight;
+                    
+                    // Update progress
+                    document.getElementById('progress-bar').style.width = `${data.progress}%`;
+                    document.getElementById('progress-text').textContent = `${data.progress}%`;
+                    
+                    // Update stats
+                    document.getElementById('valid-count').textContent = data.valid_count;
+                    document.getElementById('checked-count').textContent = Math.round(data.total * (data.progress/100));
+                    document.getElementById('total-count').textContent = data.total;
+                });
             </script>
         </head>
         <body>
-            <h2>Results</h2>
+            <h2>Live Results</h2>
             
             <div class="stats">
                 <div>Valid Emails: <span id="valid-count">0</span></div>
@@ -250,15 +304,6 @@ def results():
         </html>
     ''')
 
-@app.route('/get-updates')
-def get_updates():
-    return jsonify({
-        'emails': results_state['emails'][-MAX_DISPLAY_EMAILS:],
-        'valid_count': len(results_state['valid_emails']),
-        'progress': results_state['progress'],
-        'total': results_state['total']
-    })
-
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
     parser.add_argument('-e', '--email', help='Masked email (e.g. r****r@gmail.com)')
@@ -267,7 +312,7 @@ def cli_entry():
     args = parser.parse_args()
 
     if args.web:
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
     elif args.email:
         if not re.match(r'^[a-z0-9.*]+@[a-z]+\.[a-z]+$', args.email):
             console.print("[red]❌ Invalid email format[/red]")
