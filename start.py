@@ -75,19 +75,18 @@ import smtplib
 import socket
 
 def is_really_valid_email(email):
-    # Step 1: Format check
+   
     if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
         return False
 
     try:
         domain = email.split('@')[1].lower()
 
-        # Step 2: Skip reserved/fake domains
         fake_tlds = ('.test', '.invalid', '.example', '.local')
         if domain.endswith(fake_tlds):
             return False
 
-        # Step 3: Check MX records only
+       
         mx_records = dns.resolver.resolve(domain, 'MX')
         return len(mx_records) > 0
 
