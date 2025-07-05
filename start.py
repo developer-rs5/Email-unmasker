@@ -170,7 +170,7 @@ def run_verification(masked, threads):
             
             for future in as_completed(futures):
                 email = futures[future]
-                if email in seen_emails:
+                if email in seen_emails:  
                     continue
                 seen_emails.add(email)
 
