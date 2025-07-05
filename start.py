@@ -72,39 +72,18 @@ def generate_emails(masked):
 
 def is_valid_email(email):
     try:
-        local, domain = email.lower().split("@")
-    except ValueError:
-        return False, "❌ Invalid format"
+        domain = email.split('@')[1]
+        mx_record = dns.resolver.resolve(domain, 'MX')
+        host = str(mx_record[0].exchange)
 
-    # Basic email pattern
-    if not re.match(r"^[a-z0-9](\.?[a-z0-9]){4,29}@[a-z0-9-]+\.[a-z]{2,}$", email):
-        return False, "❌ Invalid format"
-
-    # MX Record check
-    try:
-        mx = dns.resolver.resolve(domain, 'MX')
-        mailserver = str(mx[0].exchange).rstrip('.')
-    except:
-        return False, "❌ No MX"
-
-    # Domains that block SMTP verification
-    if domain in UNVERIFIABLE_DOMAINS:
-        return None, "⚠ Cannot verify (big provider)"
-
-    # Try SMTP check (non-Gmail)
-    try:
-        server = smtplib.SMTP(mailserver, 25, timeout=SMTP_TIMEOUT)
+        server = smtplib.SMTP(host, 25, timeout=5)
         server.helo()
-        server.mail("verify@domain.com")
+        server.mail('check@example.com')
         code, _ = server.rcpt(email)
         server.quit()
-        if code in (250, 252):
-            return True, "✅ Valid"
-        else:
-            return False, f"❌ SMTP rejected ({code})"
-    except Exception as e:
-        return False, f"❌ SMTP error"
-
+        return code == 250
+    except Exception:
+        return False
 
 def update_web_interface(email, status, valid_count, progress, total):
     with app.test_request_context():
