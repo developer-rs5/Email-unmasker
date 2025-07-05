@@ -22,6 +22,7 @@ from flask_socketio import SocketIO
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 MAX_THREADS = 500
+UNVERIFIABLE_DOMAINS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'protonmail.com']
 SMTP_TIMEOUT = 5
 VALID_EMAILS_FILE = "results/valid-emails.txt"
 MAX_DISPLAY_EMAILS = 500
@@ -70,52 +71,41 @@ def generate_emails(masked):
         yield ''.join(temp) + '@' + domain
 
 def is_valid_email(email):
-    """Improved email validation with safer Gmail handling"""
     try:
-        local_part, domain = email.split("@")
+        local, domain = email.lower().split("@")
     except ValueError:
-        return False
+        return False, "❌ Invalid format"
 
-    domain = domain.lower()
-    email = email.lower()
+    # Basic email pattern
+    if not re.match(r"^[a-z0-9](\.?[a-z0-9]){4,29}@[a-z0-9-]+\.[a-z]{2,}$", email):
+        return False, "❌ Invalid format"
 
-    # 1. Basic syntax check
-    if not re.match(r'^[a-z0-9]+([._]?[a-z0-9]+)*@[a-z0-9-]+\.[a-z]{2,}$', email):
-        return False
-
-    # 2. DNS MX lookup
+    # MX Record check
     try:
-        mx_records = dns.resolver.resolve(domain, 'MX')
-        if not mx_records:
-            return False
-        host = str(mx_records[0].exchange).rstrip('.')
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.resolver.Timeout):
-        return False
+        mx = dns.resolver.resolve(domain, 'MX')
+        mailserver = str(mx[0].exchange).rstrip('.')
+    except:
+        return False, "❌ No MX"
 
-    # 3. Gmail-specific handling (Gmail blocks SMTP verification)
-    if 'gmail.com' in domain or 'googlemail.com' in domain:
-        # Gmail username rules
-        if not re.match(r'^[a-z0-9](\.?[a-z0-9]){5,29}$', local_part):
-            return False
-        # ⚠️ Instead of assuming it's valid, simulate optional checks
-        return True  # Best-effort; can't truly verify
+    # Domains that block SMTP verification
+    if domain in UNVERIFIABLE_DOMAINS:
+        return None, "⚠ Cannot verify (big provider)"
 
-    # 4. SMTP check for non-Gmail
-    for port in (25, 587):
-        try:
-            server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
-            server.helo()
-            server.mail('check@example.com')
-            code, _ = server.rcpt(email)
-            server.quit()
-            if code in (250, 252):
-                return True
-        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, ConnectionRefusedError):
-            continue
-        except Exception:
-            continue
+    # Try SMTP check (non-Gmail)
+    try:
+        server = smtplib.SMTP(mailserver, 25, timeout=SMTP_TIMEOUT)
+        server.helo()
+        server.mail("verify@domain.com")
+        code, _ = server.rcpt(email)
+        server.quit()
+        if code in (250, 252):
+            return True, "✅ Valid"
+        else:
+            return False, f"❌ SMTP rejected ({code})"
+    except Exception as e:
+        return False, f"❌ SMTP error"
 
-    return False
+
 def update_web_interface(email, status, valid_count, progress, total):
     with app.test_request_context():
         socketio.emit('update', {
