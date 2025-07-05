@@ -70,10 +70,15 @@ def generate_emails(masked):
         yield ''.join(temp) + '@' + domain
 
 def is_valid_email(email):
-    """Enhanced email validation with multi-layered approach"""
-    domain = email.split('@')[1]
+    """More accurate email validation with better Gmail handling"""
+    domain = email.split('@')[1].lower()
+    local_part = email.split('@')[0]
     
-    # 1. Check DNS MX records
+    # 1. Basic format validation
+    if not re.match(r'^[a-z0-9]+(?:[.+][a-z0-9]+)*@[a-z0-9-]+\.[a-z]{2,}$', email):
+        return False
+    
+    # 2. Check DNS MX records
     try:
         mx_records = dns.resolver.resolve(domain, 'MX')
         if not mx_records:
@@ -82,35 +87,29 @@ def is_valid_email(email):
     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
         return False
     
-    # 2. Try SMTP verification with multiple ports
+    # 3. Gmail-specific validation
+    if 'gmail' in domain or 'googlemail' in domain:
+        # Validate Gmail specific rules
+        if not re.match(r'^[a-z0-9](?:[a-z0-9.]{0,28}[a-z0-9])?$', local_part):
+            return False
+            
+        # Gmail doesn't allow SMTP verification, so we consider it valid
+        # if it passes format and MX checks
+        return True
+    
+    # 4. SMTP verification for non-Gmail domains
     ports = [25, 587, 465]
-    valid = False
     
     for port in ports:
         try:
             server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
             server.helo()
             server.mail('check@example.com')
-            
-            # Special handling for Gmail
-            if 'gmail' in domain:
-                # Gmail often blocks verification, so we use different approach
-                try:
-                    server.rcpt(email)
-                    # If we get here, it didn't immediately reject
-                    valid = True
-                except smtplib.SMTPRecipientsRefused:
-                    # Gmail refused to verify - not necessarily invalid
-                    valid = True
-                except Exception:
-                    valid = False
-            else:
-                # Standard verification for other domains
-                code, _ = server.rcpt(email)
-                valid = code == 250
-                
+            code, _ = server.rcpt(email)
             server.quit()
-            if valid:
+            
+            # Some servers return 250 for valid, others might return 252
+            if code in (250, 252):
                 return True
                 
         except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, 
@@ -119,13 +118,8 @@ def is_valid_email(email):
         except Exception:
             continue
     
-    # 3. Fallback: Check common email patterns (like Gmail address)
-    if 'gmail' in domain:
-        # Gmail addresses are always valid if they pass regex check
-        return bool(re.match(r'^[a-z0-9]+(?:[.+][a-z0-9]+)*@gmail\.com$', email))
-    
     return False
-
+    
 def update_web_interface(email, status, valid_count, progress, total):
     with app.test_request_context():
         socketio.emit('update', {
