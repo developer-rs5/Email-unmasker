@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import re
 import smtplib
 import dns.resolver
@@ -9,6 +11,7 @@ from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.live import Live
+from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
 from rich.text import Text
@@ -16,7 +19,6 @@ from pyfiglet import Figlet
 import argparse
 from flask import Flask, render_template_string, request, redirect, url_for
 from flask_socketio import SocketIO
-from rich.layout import Layout
 
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -118,18 +120,16 @@ def run_verification(masked, threads):
     )
     task = progress.add_task("Checking...", total=total)
     
-    # Create results display
+    # Create results display using deque
     last_results = deque(maxlen=MAX_DISPLAY_EMAILS)
-    results_display = Panel("", title="Results", border_style="blue")
+    results_display = Text("", no_wrap=True)
+    results_panel = Panel(results_display, title="Results", border_style="blue")
     
     # Create layout
-    layout = Layout()
-    layout.split(
-        Layout(progress, name="progress", size=3),
-        Layout(results_display, name="results")
-    )
+    group = Panel(progress, title="Progress", border_style="green")
+    main_layout = Panel(group, title="Email Unmasker", border_style="bold magenta")
     
-    with Live(layout, refresh_per_second=10, console=console) as live:
+    with Live(main_layout, refresh_per_second=10, console=console) as live:
         with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
             futures = {executor.submit(is_valid_email, email): email for email in emails}
             
@@ -142,11 +142,12 @@ def run_verification(masked, threads):
                 try:
                     valid = future.result()
                     status = "✅ Valid" if valid else "❌ Invalid"
+                    color = "green" if valid else "red"
                     
                     # Update results display
-                    color = "green" if valid else "red"
                     last_results.appendleft(f"[{color}]{email} - {status}[/]")
-                    results_display.renderable = Text("\n".join(last_results), no_wrap=True)
+                    results_display = Text("\n".join(last_results), no_wrap=True)
+                    results_panel.renderable = results_display
                     
                     # Update web interface
                     if valid:
@@ -167,16 +168,19 @@ def run_verification(masked, threads):
 
                     # Update progress
                     progress.update(task, advance=1)
-                    live.refresh()
+                    
+                    # Refresh display
+                    live.update(main_layout)
 
                 except Exception as e:
                     last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
-                    results_display.renderable = Text("\n".join(last_results), no_wrap=True)
+                    results_display = Text("\n".join(last_results), no_wrap=True)
+                    results_panel.renderable = results_display
                     results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
                     progress_percent = int((checked_count / total) * 100)
                     update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
                     progress.update(task, advance=1)
-                    live.refresh()
+                    live.update(main_layout)
 
     if valid_emails:
         with open(VALID_EMAILS_FILE, "w") as f:
