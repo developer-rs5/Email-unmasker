@@ -1,6 +1,4 @@
-
 import re
-import smtplib
 import dns.resolver
 import time
 import os
@@ -22,7 +20,6 @@ from flask_socketio import SocketIO
 # Configuration
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 MAX_THREADS = 500
-UNVERIFIABLE_DOMAINS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'protonmail.com']
 SMTP_TIMEOUT = 5
 VALID_EMAILS_FILE = "results/valid-emails.txt"
 MAX_DISPLAY_EMAILS = 500
@@ -34,7 +31,7 @@ SOCIAL_LINKS = {
 
 console = Console()
 app = Flask(__name__)
-socketio = SocketIO(app)
+socketio = SocketIO(app, async_mode='threading')
 
 # Shared state for web interface
 results_state = {
@@ -71,41 +68,41 @@ def generate_emails(masked):
         yield ''.join(temp) + '@' + domain
 
 resolver = dns.resolver.Resolver()
-resolver.nameservers = ['8.8.8.8', '1.1.1.1']  # Google & Cloudflare DNS
+resolver.nameservers = ['8.8.8.8', '1.1.1.1', '8.8.4.4']  # Google & Cloudflare DNS
 
 def is_valid_email(email):
-    # Basic format validation
-    if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
+    # Enhanced email format validation
+    if not re.fullmatch(r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)", email):
         return False
 
     try:
         domain = email.split('@')[1].lower()
 
-        # Optional: Skip reserved/fake TLDs
-        if domain.endswith(('.test', '.invalid', '.example', '.local')):
+        # Skip reserved/fake TLDs
+        if domain.endswith(('.test', '.invalid', '.example', '.local', '.localhost')):
             return False
 
         # Resolve MX records using custom resolver
         mx_records = resolver.resolve(domain, 'MX')
         return bool(mx_records)
 
-    except Exception as e:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.Timeout):
         return False
-
-
+    except Exception as e:
+        console.print(f"[yellow]DNS error for {email}: {str(e)}[/yellow]")
+        return False
 
 def update_web_interface(email, status, valid_count, progress, total):
     try:
-        with app.test_request_context():
-            socketio.emit('update', {
-                'email': email,
-                'status': status,
-                'valid_count': valid_count,
-                'progress': progress,
-                'total': total
-            })
+        socketio.emit('update', {
+            'email': email,
+            'status': status,
+            'valid_count': valid_count,
+            'progress': progress,
+            'total': total
+        }, namespace='/')
     except Exception as e:
-        print(f"Web interface update failed: {str(e)}")
+        console.print(f"[red]Web interface update failed: {str(e)}[/red]")
          
 def run_verification(masked, threads):
     global results_state
@@ -203,10 +200,12 @@ def run_verification(masked, threads):
                 f.write(email + "\n")
         box = "\n".join(sorted(valid_emails))
         console.print(Panel(box, title="✅ Valid Emails Found", border_style="green"))
+        console.print(f"[green]Saved to {VALID_EMAILS_FILE}[/green]")
     else:
         console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
     
     results_state['running'] = False
+    console.print(f"[cyan]Total time: {time.time() - start_time:.2f} seconds[/cyan]")
 
 
 @app.route('/', methods=['GET', 'POST'])
@@ -230,31 +229,43 @@ def index():
             <title>Email Unmasker</title>
             <style>
                 body { font-family: Arial, sans-serif; background: #1a1a1a; color: #f0f0f0; text-align: center; }
-                input, button { padding: 10px; margin: 10px; font-size: 1em; }
+                input, button { padding: 10px; margin: 10px; font-size: 1em; border-radius: 5px; }
+                input { width: 300px; background: #333; color: white; border: 1px solid #444; }
                 button { background-color: #28a745; color: white; border: none; cursor: pointer; }
-                h2 { color: #00ffcc; }
+                button:hover { background-color: #218838; }
+                h2 { color: #00ffcc; text-shadow: 0 0 5px rgba(0,255,204,0.5); }
                 .social-links { margin-top: 20px; }
                 .social-links a { margin: 0 10px; color: #00ccff; text-decoration: none; }
+                .social-links a:hover { text-decoration: underline; }
+                .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+                .info-box { background: #222; padding: 15px; border-radius: 8px; margin: 20px 0; }
             </style>
         </head>
         <body>
-            <h2>🔍 Email Unmasker Web</h2>
-            <form method="post">
-                <label>Masked Email:</label><br>
-                <input name="masked" placeholder="r****r@gmail.com" required><br>
-                <label>Threads:</label><br>
-                <input name="threads" type="number" value="20" min="1" max="100" required><br>
-                <button type="submit">Start</button>
-            </form>
-            
-            <div class="social-links">
-                <p>Connect with us:</p>
-                <a href="https://discord.zenuxs.xyz" target="_blank">Discord</a>
-                <a href="https://instagram.com/developer.rs" target="_blank">Instagram</a>
-                <a href="https://github.com/developer-rs5" target="_blank">GitHub</a>
+            <div class="container">
+                <h2>🔍 Email Unmasker Web</h2>
+                <form method="post">
+                    <label>Masked Email:</label><br>
+                    <input name="masked" placeholder="r****r@gmail.com" required><br>
+                    <label>Threads (1-500):</label><br>
+                    <input name="threads" type="number" value="50" min="1" max="500" required><br>
+                    <button type="submit">Start Verification</button>
+                </form>
+                
+                <div class="info-box">
+                    <p><b>Format:</b> Use * for unknown characters (e.g. r****r@gmail.com)</p>
+                    <p><b>Note:</b> Higher thread counts may cause performance issues</p>
+                </div>
+                
+                <div class="social-links">
+                    <p>Connect with us:</p>
+                    <a href="https://discord.zenuxs.xyz" target="_blank">Discord</a>
+                    <a href="https://instagram.com/developer.rs" target="_blank">Instagram</a>
+                    <a href="https://github.com/developer-rs5" target="_blank">GitHub</a>
+                </div>
+                
+                <p>Developed by <b>developer.rs</b> | CLI + Web | DNS-based email validation</p>
             </div>
-            
-            <p>Developed by <b>developer.rs</b> | CLI + Web | SMTP-based email validation</p>
         </body>
         </html>
     ''')
@@ -267,55 +278,61 @@ def live_results():
             <title>Live Results</title>
             <style>
                 body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
-                #results { height: 70vh; overflow-y: auto; border: 1px solid #444; padding: 10px; }
+                #results { height: 70vh; overflow-y: auto; border: 1px solid #444; padding: 10px; background: #0a0a0a; }
                 .valid { color: #0f0; }
                 .invalid { color: #f00; }
                 .error { color: #ff0; }
-                .progress-container { width: 100%; background-color: #333; margin: 10px 0; }
-                .progress-bar { height: 20px; background-color: #28a745; width: 0%; }
-                .stats { margin: 10px 0; }
+                .progress-container { width: 100%; background-color: #333; margin: 10px 0; border-radius: 3px; }
+                .progress-bar { height: 20px; background-color: #28a745; width: 0%; border-radius: 3px; transition: width 0.3s; }
+                .stats { margin: 10px 0; padding: 10px; background: #222; border-radius: 5px; }
+                .stat-value { color: #00ccff; font-weight: bold; }
+                .header { display: flex; justify-content: space-between; align-items: center; }
+                .title { font-size: 1.5em; }
             </style>
             <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
             <script>
-                const socket = io();
-                
-                socket.on('update', function(data) {
-                    // Update results list
-                    const resultsDiv = document.getElementById('results');
-                    const entry = document.createElement('div');
-                    entry.className = data.status.includes('Valid') ? 'valid' : 
-                                      data.status.includes('Invalid') ? 'invalid' : 'error';
-                    entry.textContent = `${data.email} - ${data.status}`;
-                    resultsDiv.appendChild(entry);
-                    resultsDiv.scrollTop = resultsDiv.scrollHeight;
+                document.addEventListener('DOMContentLoaded', function() {
+                    const socket = io();
                     
-                    // Update progress
-                    document.getElementById('progress-bar').style.width = `${data.progress}%`;
-                    document.getElementById('progress-text').textContent = `${data.progress}%`;
-                    
-                    // Update stats
-                    document.getElementById('valid-count').textContent = data.valid_count;
-                    document.getElementById('checked-count').textContent = Math.round(data.total * (data.progress/100));
-                    document.getElementById('total-count').textContent = data.total;
+                    socket.on('update', function(data) {
+                        // Update results list
+                        const resultsDiv = document.getElementById('results');
+                        const entry = document.createElement('div');
+                        entry.className = data.status.includes('Valid') ? 'valid' : 
+                                          data.status.includes('Invalid') ? 'invalid' : 'error';
+                        entry.textContent = `${data.email} - ${data.status}`;
+                        resultsDiv.appendChild(entry);
+                        resultsDiv.scrollTop = resultsDiv.scrollHeight;
+                        
+                        // Update progress
+                        document.getElementById('progress-bar').style.width = `${data.progress}%`;
+                        document.getElementById('progress-text').textContent = `${Math.round(data.progress)}%`;
+                        
+                        // Update stats
+                        document.getElementById('valid-count').textContent = data.valid_count;
+                        document.getElementById('checked-count').textContent = Math.round(data.total * (data.progress/100));
+                        document.getElementById('total-count').textContent = data.total;
+                    });
                 });
             </script>
         </head>
         <body>
-            <h2>Live Results</h2>
+            <div class="header">
+                <h2 class="title">Live Results</h2>
+                <a href="/" style="color: #00ccff; text-decoration: none;">← Back to Home</a>
+            </div>
             
             <div class="stats">
-                <div>Valid Emails: <span id="valid-count">0</span></div>
-                <div>Progress: <span id="checked-count">0</span>/<span id="total-count">0</span></div>
+                <div>Valid Emails: <span id="valid-count" class="stat-value">0</span></div>
+                <div>Progress: <span id="checked-count" class="stat-value">0</span>/<span id="total-count" class="stat-value">0</span></div>
             </div>
             
             <div class="progress-container">
                 <div id="progress-bar" class="progress-bar"></div>
             </div>
-            <div id="progress-text" style="text-align: center;">0%</div>
+            <div id="progress-text" style="text-align: center; margin-bottom: 15px;">0%</div>
             
             <div id="results"></div>
-            
-            <a href="/" style="color: #00ccff;">← Back to Home</a>
         </body>
         </html>
     ''')
@@ -323,31 +340,32 @@ def live_results():
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
     parser.add_argument('-e', '--email', help='Masked email (e.g. r****r@gmail.com)')
-    parser.add_argument('-t', '--threads', help='Threads count (default: 20)', type=int, default=20)
+    parser.add_argument('-t', '--threads', help='Threads count (default: 50)', type=int, default=50)
     parser.add_argument('--web', help='Launch web interface', action='store_true')
     args = parser.parse_args()
 
     if args.web:
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+        console.print("[bold green]Starting web server on http://localhost:5000[/bold green]")
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
     elif args.email:
         if not re.match(r'^[a-z0-9.*]+@[a-z]+\.[a-z]+$', args.email):
-            console.print("[red]❌ Invalid email format[/red]")
+            console.print("[red]❌ Invalid email format. Use format like: r****r@gmail.com[/red]")
             return
         run_verification(args.email.strip().lower(), args.threads)
     else:
         animated_banner()
         while True:
-            masked = console.input("Enter masked email (e.g. r******s@gmail.com): ").strip().lower()
+            masked = console.input("[bold cyan]Enter masked email (e.g. r******s@gmail.com): [/bold]").strip().lower()
             if re.match(r'^[a-z0-9.*]+@[a-z]+\.[a-z]+$', masked):
                 break
-            console.print("[red]❌ Invalid email format[/red]")
+            console.print("[red]❌ Invalid email format. Use format like: r****r@gmail.com[/red]")
         
         while True:
             try:
-                threads = int(console.input("How many threads (requests per second)? (e.g. 50): "))
-                if threads >= 1:
+                threads = int(console.input("[bold cyan]Threads (1-500): [/bold]"))
+                if 1 <= threads <= 500:
                     break
-                console.print("[red]❌ Thread count must be at least 1[/red]")
+                console.print("[red]❌ Thread count must be between 1-500[/red]")
             except ValueError:
                 console.print("[red]❌ Invalid number[/red]")
         
