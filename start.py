@@ -8,7 +8,7 @@ import smtplib
 from collections import deque
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TextColumn
@@ -43,7 +43,8 @@ results_state = {
     'progress': 0,
     'total': 0,
     'running': False,
-    'valid_count': 0
+    'valid_count': 0,
+    'error': None
 }
 state_lock = threading.Lock()
 
@@ -133,134 +134,144 @@ def update_web_interface(email, status, valid_count, progress, total):
          
 def run_verification(masked, threads):
     global results_state
-    with state_lock:
-        results_state['running'] = True 
-        results_state['emails'] = []
-        results_state['valid_emails'] = []
-        results_state['valid_count'] = 0
-    
-    os.makedirs("results", exist_ok=True)
-    emails = list(generate_emails(masked))
-    total = len(emails)
-    
-    with state_lock:
-        results_state['total'] = total
-    
-    start_time = time.time()
-    checked_count = 0
-    valid_emails = set()
-    seen_emails = set()
+    try:
+        with state_lock:
+            results_state['running'] = True 
+            results_state['emails'] = []
+            results_state['valid_emails'] = []
+            results_state['valid_count'] = 0
+            results_state['error'] = None
+        
+        os.makedirs("results", exist_ok=True)
+        emails = list(generate_emails(masked))
+        total = len(emails)
+        
+        with state_lock:
+            results_state['total'] = total
+        
+        start_time = time.time()
+        checked_count = 0
+        valid_emails = set()
+        seen_emails = set()
 
-    # Create progress bar
-    progress = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        TimeRemainingColumn(),
-    )
-    task = progress.add_task("Checking...", total=total)
-    
-    # Create results display using deque
-    last_results = deque(maxlen=MAX_DISPLAY_EMAILS)
-    results_display = Text("", no_wrap=True)
-    results_panel = Panel(results_display, title="Results", border_style="blue")
-    
-    # Create main display
-    main_layout = Panel(
-        Panel(progress, title="Progress", border_style="green"),
-        Panel(results_panel, title="Results", border_style="blue"),
-        title="Email Unmasker", 
-        border_style="bold magenta"
-    )
-    
-    with Live(main_layout, refresh_per_second=4, console=console) as live:
-        with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
-            futures = {executor.submit(is_valid_email, email): email for email in emails}
-            
-            for future in as_completed(futures):
-                email = futures[future]
-                if email in seen_emails: 
-                    continue
-                seen_emails.add(email)
+        # Create progress bar
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            TimeRemainingColumn(),
+        )
+        task = progress.add_task("Checking...", total=total)
+        
+        # Create results display using deque
+        last_results = deque(maxlen=MAX_DISPLAY_EMAILS)
+        results_display = Text("", no_wrap=True)
+        results_panel = Panel(results_display, title="Results", border_style="blue")
+        
+        # Create main display using Group to avoid Panel substitution issue
+        main_layout = Panel(
+            Group(
+                Panel(progress, title="Progress", border_style="green"),
+                Panel(results_panel, title="Results", border_style="blue"),
+            ),
+            title="Email Unmasker", 
+            border_style="bold magenta"
+        )
+        
+        with Live(main_layout, refresh_per_second=4, console=console) as live:
+            with ThreadPoolExecutor(max_workers=min(threads, MAX_THREADS)) as executor:
+                futures = {executor.submit(is_valid_email, email): email for email in emails}
+                
+                for future in as_completed(futures):
+                    email = futures[future]
+                    if email in seen_emails: 
+                        continue
+                    seen_emails.add(email)
 
-                try:
-                    valid = future.result()
-                    smtp_status = ""
-                    
-                    if valid:
-                        domain = email.split('@')[1].lower()
-                        if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
-                            # Skip SMTP for unverifiable domains
-                            smtp_status = " (DNS)"
-                        else:
-                            # Perform SMTP verification
-                            if smtp_verify(email):
-                                smtp_status = " (SMTP)"
-                            else:
-                                valid = False
-                                smtp_status = " (SMTP Failed)"
-                    
-                    status = "✅ Valid" + smtp_status if valid else "❌ Invalid"
-                    color = "green" if valid else "red"
-                    
-                    # Update results display
-                    last_results.appendleft(f"[{color}]{email} - {status}[/]")
-                    results_display = Text("\n".join(last_results), no_wrap=True)
-                    results_panel.renderable = results_display
-                    
-                    # Update state
-                    with state_lock:
-                        if valid:
-                            valid_emails.add(email)
-                            results_state['valid_emails'].append(email)
-                            results_state['valid_count'] = len(valid_emails)
+                    try:
+                        valid = future.result()
+                        smtp_status = ""
                         
-                        checked_count += 1
-                        progress_percent = min(100, int((checked_count / total) * 100))
-                        results_state['progress'] = progress_percent
-                        results_state['emails'].append({'email': email, 'status': status})
-                    
-                    # Update web interface
-                    update_web_interface(
-                        email=email,
-                        status=status,
-                        valid_count=len(valid_emails),
-                        progress=progress_percent,
-                        total=total
-                    )
+                        if valid:
+                            domain = email.split('@')[1].lower()
+                            if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
+                                # Skip SMTP for unverifiable domains
+                                smtp_status = " (DNS)"
+                            else:
+                                # Perform SMTP verification
+                                if smtp_verify(email):
+                                    smtp_status = " (SMTP)"
+                                else:
+                                    valid = False
+                                    smtp_status = " (SMTP Failed)"
+                        
+                        status = "✅ Valid" + smtp_status if valid else "❌ Invalid"
+                        color = "green" if valid else "red"
+                        
+                        # Update results display
+                        last_results.appendleft(f"[{color}]{email} - {status}[/]")
+                        results_display = Text("\n".join(last_results), no_wrap=True)
+                        results_panel.renderable = results_display
+                        
+                        # Update state
+                        with state_lock:
+                            if valid:
+                                valid_emails.add(email)
+                                results_state['valid_emails'].append(email)
+                                results_state['valid_count'] = len(valid_emails)
+                            
+                            checked_count += 1
+                            progress_percent = min(100, int((checked_count / total) * 100))
+                            results_state['progress'] = progress_percent
+                            results_state['emails'].append({'email': email, 'status': status})
+                        
+                        # Update web interface
+                        update_web_interface(
+                            email=email,
+                            status=status,
+                            valid_count=len(valid_emails),
+                            progress=progress_percent,
+                            total=total
+                        )
 
-                    # Update progress
-                    progress.update(task, advance=1)
-                    
-                    # Refresh display
-                    live.update(main_layout)
+                        # Update progress
+                        progress.update(task, advance=1)
+                        
+                        # Refresh display
+                        live.update(main_layout)
 
-                except Exception as e:
-                    last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
-                    results_display = Text("\n".join(last_results), no_wrap=True)
-                    results_panel.renderable = results_display
-                    with state_lock:
-                        checked_count += 1
-                        progress_percent = min(100, int((checked_count / total) * 100))
-                        results_state['progress'] = progress_percent
-                        results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
-                    update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
-                    progress.update(task, advance=1)
-                    live.update(main_layout)
+                    except Exception as e:
+                        last_results.appendleft(f"[yellow]{email} - ⚠️ Error ({str(e)})[/]")
+                        results_display = Text("\n".join(last_results), no_wrap=True)
+                        results_panel.renderable = results_display
+                        with state_lock:
+                            checked_count += 1
+                            progress_percent = min(100, int((checked_count / total) * 100))
+                            results_state['progress'] = progress_percent
+                            results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
+                        update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
+                        progress.update(task, advance=1)
+                        live.update(main_layout)
 
-    if valid_emails:
-        with open(VALID_EMAILS_FILE, "w") as f:
-            for email in sorted(valid_emails):
-                f.write(email + "\n")
-        box = "\n".join(sorted(valid_emails))
-        console.print(Panel(box, title="✅ Valid Emails Found", border_style="green"))
-        console.print(f"[green]Saved to {VALID_EMAILS_FILE}[/green]")
-    else:
-        console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
-    
-    with state_lock:
-        results_state['running'] = False
-    console.print(f"[cyan]Total time: {time.time() - start_time:.2f} seconds[/cyan]")
+        if valid_emails:
+            with open(VALID_EMAILS_FILE, "w") as f:
+                for email in sorted(valid_emails):
+                    f.write(email + "\n")
+            box = "\n".join(sorted(valid_emails))
+            console.print(Panel(box, title="✅ Valid Emails Found", border_style="green"))
+            console.print(f"[green]Saved to {VALID_EMAILS_FILE}[/green]")
+        else:
+            console.print(Panel("No valid emails found.", title="❌ Result", border_style="red"))
+        
+        console.print(f"[cyan]Total time: {time.time() - start_time:.2f} seconds[/cyan]")
+
+    except Exception as e:
+        console.print(f"[red]Error in verification process: {str(e)}[/red]")
+        with state_lock:
+            results_state['error'] = str(e)
+    finally:
+        with state_lock:
+            results_state['running'] = False
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -385,6 +396,14 @@ def index():
 def live_results():
     with state_lock:
         if not results_state['running']:
+            if results_state.get('error'):
+                return render_template_string('''
+                    <div style="color: red; padding: 20px;">
+                        <h2>Verification Failed</h2>
+                        <p>{{ error }}</p>
+                        <a href="/">Back to Home</a>
+                    </div>
+                ''', error=results_state['error'])
             return redirect(url_for('index'))
             
     return render_template_string('''
@@ -522,7 +541,8 @@ def current_state():
             'emails': results_state['emails'],
             'valid_count': results_state['valid_count'],
             'progress': results_state['progress'],
-            'total': results_state['total']
+            'total': results_state['total'],
+            'error': results_state.get('error')
         }
 
 def cli_entry():
