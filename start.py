@@ -22,7 +22,7 @@ from flask_socketio import SocketIO, emit
 CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 MAX_THREADS = 500
 UNVERIFIABLE_DOMAINS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'protonmail.com']
-SMTP_TIMEOUT = 5
+SMTP_TIMEOUT = 10
 VALID_EMAILS_FILE = "results/valid-emails.txt"
 MAX_DISPLAY_EMAILS = 500
 SOCIAL_LINKS = {
@@ -100,23 +100,43 @@ def is_valid_email(email):
         return False
 
 def smtp_verify(email):
-    """Perform SMTP verification for email addresses"""
+    """Perform SMTP verification for email addresses with improved reliability"""
     try:
         domain = email.split('@')[1]
         records = dns.resolver.resolve(domain, 'MX')
-        mx_record = str(records[0].exchange).rstrip('.')
+        if not records:
+            return False
+            
+        # Get highest priority MX record
+        mx_records = sorted(records, key=lambda r: r.preference)
+        mx_record = str(mx_records[0].exchange).rstrip('.')
         
         # Connect to SMTP server
         server = smtplib.SMTP(timeout=SMTP_TIMEOUT)
         server.connect(mx_record, 25)
-        server.ehlo_or_helo_if_needed()
+        
+        # Send EHLO/HELO
+        code, _ = server.ehlo()
+        if code not in (250, 220):
+            server.quit()
+            return False
+            
+        # Start mail transaction
+        server.mail('verify@example.com')
         
         # Check recipient
-        server.mail('verify@example.com')
         code, _ = server.rcpt(email)
         server.quit()
         
-        return code == 250  # 250 indicates valid recipient
+        return code in (250, 251)  # 250/251 indicates valid recipient
+    except smtplib.SMTPServerDisconnected:
+        return False
+    except smtplib.SMTPConnectError:
+        return False
+    except smtplib.SMTPResponseException as e:
+        if e.smtp_code in (450, 451, 452, 550, 551, 552, 553):
+            return False
+        return True  # Consider valid for other codes
     except Exception as e:
         return False
 
@@ -197,16 +217,24 @@ def run_verification(masked, threads):
                             if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
                                 # Skip SMTP for unverifiable domains
                                 smtp_status = " (DNS)"
+                                # For unverifiable domains, we can't confirm validity
+                                status = "⚠️ Unverifiable" + smtp_status
+                                color = "yellow"
+                                valid = False  # Don't count as valid since we can't confirm
                             else:
                                 # Perform SMTP verification
-                                if smtp_verify(email):
+                                smtp_valid = smtp_verify(email)
+                                if smtp_valid:
                                     smtp_status = " (SMTP)"
+                                    status = "✅ Valid" + smtp_status
+                                    color = "green"
                                 else:
+                                    status = "❌ Invalid (SMTP Failed)"
+                                    color = "red"
                                     valid = False
-                                    smtp_status = " (SMTP Failed)"
-                        
-                        status = "✅ Valid" + smtp_status if valid else "❌ Invalid"
-                        color = "green" if valid else "red"
+                        else:
+                            status = "❌ Invalid (DNS)"
+                            color = "red"
                         
                         # Update results display
                         last_results.appendleft(f"[{color}]{email} - {status}[/]")
@@ -218,7 +246,7 @@ def run_verification(masked, threads):
                             if valid:
                                 valid_emails.add(email)
                                 results_state['valid_emails'].append(email)
-                                results_state['valid_count'] = len(valid_emails)
+                                results_state['valid_count'] = len(valid_emiles)
                             
                             checked_count += 1
                             progress_percent = min(100, int((checked_count / total) * 100))
@@ -427,6 +455,7 @@ def live_results():
                 .result-valid { color: #3fb950; }
                 .result-invalid { color: #f85149; }
                 .result-error { color: #d29922; }
+                .result-unverifiable { color: #d2b922; }
                 .back-btn { display: inline-block; padding: 10px 20px; background: #1f6feb; border-radius: 6px; color: white; text-decoration: none; margin-top: 25px; transition: all 0.3s; }
                 .back-btn:hover { background: #2a7aef; transform: translateY(-3px); }
             </style>
@@ -457,6 +486,8 @@ def live_results():
                                         entry.classList.add('result-valid');
                                     } else if (item.status.includes('Invalid')) {
                                         entry.classList.add('result-invalid');
+                                    } else if (item.status.includes('Unverifiable')) {
+                                        entry.classList.add('result-unverifiable');
                                     } else {
                                         entry.classList.add('result-error');
                                     }
@@ -488,6 +519,8 @@ def live_results():
                             entry.classList.add('result-valid');
                         } else if (data.status.includes('Invalid')) {
                             entry.classList.add('result-invalid');
+                        } else if (data.status.includes('Unverifiable')) {
+                            entry.classList.add('result-unverifiable');
                         } else {
                             entry.classList.add('result-error');
                         }
