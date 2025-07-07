@@ -44,7 +44,8 @@ results_state = {
     'total': 0,
     'running': False,
     'valid_count': 0,
-    'error': None
+    'error': None,
+    'checked_count': 0
 }
 state_lock = threading.Lock()
 
@@ -128,15 +129,15 @@ def smtp_verify(email):
         code, _ = server.rcpt(email)
         server.quit()
         
-        return code in (250, 251)  # 250/251 indicates valid recipient
+        # Only 250 and 251 are valid
+        return code in (250, 251)
     except smtplib.SMTPServerDisconnected:
         return False
     except smtplib.SMTPConnectError:
         return False
     except smtplib.SMTPResponseException as e:
-        if e.smtp_code in (450, 451, 452, 550, 551, 552, 553):
-            return False
-        return True  # Consider valid for other codes
+        # Any SMTP error response means invalid
+        return False
     except Exception as e:
         return False
 
@@ -161,6 +162,7 @@ def run_verification(masked, threads):
             results_state['valid_emails'] = []
             results_state['valid_count'] = 0
             results_state['error'] = None
+            results_state['checked_count'] = 0
         
         os.makedirs("results", exist_ok=True)
         emails = list(generate_emails(masked))
@@ -170,7 +172,6 @@ def run_verification(masked, threads):
             results_state['total'] = total
         
         start_time = time.time()
-        checked_count = 0
         valid_emails = set()
         seen_emails = set()
 
@@ -209,29 +210,27 @@ def run_verification(masked, threads):
                     seen_emails.add(email)
 
                     try:
-                        valid = future.result()
-                        smtp_status = ""
+                        dns_valid = future.result()
+                        status = ""
+                        color = ""
+                        valid = False
                         
-                        if valid:
+                        if dns_valid:
                             domain = email.split('@')[1].lower()
                             if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
                                 # Skip SMTP for unverifiable domains
-                                smtp_status = " (DNS)"
-                                # For unverifiable domains, we can't confirm validity
-                                status = "⚠️ Unverifiable" + smtp_status
+                                status = "⚠️ Unverifiable (DNS)"
                                 color = "yellow"
-                                valid = False  # Don't count as valid since we can't confirm
                             else:
                                 # Perform SMTP verification
                                 smtp_valid = smtp_verify(email)
                                 if smtp_valid:
-                                    smtp_status = " (SMTP)"
-                                    status = "✅ Valid" + smtp_status
+                                    status = "✅ Valid (SMTP)"
                                     color = "green"
+                                    valid = True
                                 else:
                                     status = "❌ Invalid (SMTP Failed)"
                                     color = "red"
-                                    valid = False
                         else:
                             status = "❌ Invalid (DNS)"
                             color = "red"
@@ -246,10 +245,10 @@ def run_verification(masked, threads):
                             if valid:
                                 valid_emails.add(email)
                                 results_state['valid_emails'].append(email)
-                                results_state['valid_count'] = len(valid_emiles)
+                                results_state['valid_count'] = len(valid_emails)
                             
-                            checked_count += 1
-                            progress_percent = min(100, int((checked_count / total) * 100))
+                            results_state['checked_count'] += 1
+                            progress_percent = min(100, int((results_state['checked_count'] / total) * 100))
                             results_state['progress'] = progress_percent
                             results_state['emails'].append({'email': email, 'status': status})
                         
@@ -273,8 +272,8 @@ def run_verification(masked, threads):
                         results_display = Text("\n".join(last_results), no_wrap=True)
                         results_panel.renderable = results_display
                         with state_lock:
-                            checked_count += 1
-                            progress_percent = min(100, int((checked_count / total) * 100))
+                            results_state['checked_count'] += 1
+                            progress_percent = min(100, int((results_state['checked_count'] / total) * 100))
                             results_state['progress'] = progress_percent
                             results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
                         update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
@@ -295,6 +294,8 @@ def run_verification(masked, threads):
 
     except Exception as e:
         console.print(f"[red]Error in verification process: {str(e)}[/red]")
+        import traceback
+        traceback.print_exc()
         with state_lock:
             results_state['error'] = str(e)
     finally:
@@ -426,11 +427,22 @@ def live_results():
         if not results_state['running']:
             if results_state.get('error'):
                 return render_template_string('''
-                    <div style="color: red; padding: 20px;">
-                        <h2>Verification Failed</h2>
-                        <p>{{ error }}</p>
-                        <a href="/">Back to Home</a>
-                    </div>
+                    <html>
+                    <head>
+                        <title>Error</title>
+                        <style>
+                            body { font-family: Arial; background: #1a1a1a; color: #f0f0f0; text-align: center; padding: 50px; }
+                            .error-box { background: #222; padding: 30px; border-radius: 10px; max-width: 600px; margin: 0 auto; border: 1px solid #ff5555; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="error-box">
+                            <h2 style="color: #ff5555;">Verification Failed</h2>
+                            <p>{{ error }}</p>
+                            <p><a href="/" style="color: #00ccff;">Back to Home</a></p>
+                        </div>
+                    </body>
+                    </html>
                 ''', error=results_state['error'])
             return redirect(url_for('index'))
             
@@ -470,8 +482,7 @@ def live_results():
                         .then(data => {
                             if (data.running) {
                                 document.getElementById('valid-count').textContent = data.valid_count;
-                                const checked = Math.round(data.total * (data.progress/100));
-                                document.getElementById('checked-count').textContent = checked;
+                                document.getElementById('checked-count').textContent = data.checked_count;
                                 document.getElementById('total-count').textContent = data.total;
                                 document.getElementById('progress-fill').style.width = `${data.progress}%`;
                                 document.getElementById('progress-text').textContent = `${Math.round(data.progress)}% Complete`;
@@ -502,8 +513,7 @@ def live_results():
                     socket.on('update', function(data) {
                         // Update stats
                         document.getElementById('valid-count').textContent = data.valid_count;
-                        const checked = Math.round(data.total * (data.progress/100));
-                        document.getElementById('checked-count').textContent = checked;
+                        document.getElementById('checked-count').textContent = data.checked_count;
                         document.getElementById('total-count').textContent = data.total;
                         
                         // Update progress bar
@@ -575,6 +585,7 @@ def current_state():
             'valid_count': results_state['valid_count'],
             'progress': results_state['progress'],
             'total': results_state['total'],
+            'checked_count': results_state['checked_count'],
             'error': results_state.get('error')
         }
 
