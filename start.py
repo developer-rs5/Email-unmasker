@@ -4,6 +4,7 @@ import time
 import os
 import socket
 import threading
+import smtplib
 from collections import deque
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,7 +42,8 @@ results_state = {
     'valid_emails': [],
     'progress': 0,
     'total': 0,
-    'running': False
+    'running': False,
+    'valid_count': 0
 }
 state_lock = threading.Lock()
 
@@ -87,10 +89,6 @@ def is_valid_email(email):
         if domain.endswith(('.test', '.invalid', '.example', '.local', '.localhost')):
             return False
 
-        # Skip unverifiable domains
-        if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
-            return False
-
         # Resolve MX records using custom resolver
         mx_records = resolver.resolve(domain, 'MX')
         return bool(mx_records)
@@ -110,27 +108,26 @@ def smtp_verify(email):
         # Connect to SMTP server
         server = smtplib.SMTP(timeout=SMTP_TIMEOUT)
         server.connect(mx_record, 25)
-        server.ehlo()
+        server.ehlo_or_helo_if_needed()
         
         # Check recipient
         server.mail('verify@example.com')
         code, _ = server.rcpt(email)
         server.quit()
         
-        return code in (250, 251)  # 250/251 indicate valid recipient
-    except Exception:
+        return code == 250  # 250 indicates valid recipient
+    except Exception as e:
         return False
 
 def update_web_interface(email, status, valid_count, progress, total):
     try:
-        with state_lock:
-            socketio.emit('update', {
-                'email': email,
-                'status': status,
-                'valid_count': valid_count,
-                'progress': progress,
-                'total': total
-            }, namespace='/')
+        socketio.emit('update', {
+            'email': email,
+            'status': status,
+            'valid_count': valid_count,
+            'progress': progress,
+            'total': total
+        }, namespace='/', broadcast=True)
     except Exception as e:
         pass
          
@@ -140,6 +137,7 @@ def run_verification(masked, threads):
         results_state['running'] = True 
         results_state['emails'] = []
         results_state['valid_emails'] = []
+        results_state['valid_count'] = 0
     
     os.makedirs("results", exist_ok=True)
     emails = list(generate_emails(masked))
@@ -170,6 +168,7 @@ def run_verification(masked, threads):
     # Create main display
     main_layout = Panel(
         Panel(progress, title="Progress", border_style="green"),
+        Panel(results_panel, title="Results", border_style="blue"),
         title="Email Unmasker", 
         border_style="bold magenta"
     )
@@ -186,11 +185,22 @@ def run_verification(masked, threads):
 
                 try:
                     valid = future.result()
-                    if valid:
-                        # Perform additional SMTP verification
-                        valid = smtp_verify(email)
+                    smtp_status = ""
                     
-                    status = "✅ Valid" if valid else "❌ Invalid"
+                    if valid:
+                        domain = email.split('@')[1].lower()
+                        if any(domain.endswith(d) for d in UNVERIFIABLE_DOMAINS):
+                            # Skip SMTP for unverifiable domains
+                            smtp_status = " (DNS)"
+                        else:
+                            # Perform SMTP verification
+                            if smtp_verify(email):
+                                smtp_status = " (SMTP)"
+                            else:
+                                valid = False
+                                smtp_status = " (SMTP Failed)"
+                    
+                    status = "✅ Valid" + smtp_status if valid else "❌ Invalid"
                     color = "green" if valid else "red"
                     
                     # Update results display
@@ -203,12 +213,14 @@ def run_verification(masked, threads):
                         if valid:
                             valid_emails.add(email)
                             results_state['valid_emails'].append(email)
+                            results_state['valid_count'] = len(valid_emails)
                         
-                        results_state['emails'].append({'email': email, 'status': status})
                         checked_count += 1
-                        progress_percent = int((checked_count / total) * 100)
+                        progress_percent = min(100, int((checked_count / total) * 100))
                         results_state['progress'] = progress_percent
+                        results_state['emails'].append({'email': email, 'status': status})
                     
+                    # Update web interface
                     update_web_interface(
                         email=email,
                         status=status,
@@ -228,10 +240,10 @@ def run_verification(masked, threads):
                     results_display = Text("\n".join(last_results), no_wrap=True)
                     results_panel.renderable = results_display
                     with state_lock:
-                        results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
                         checked_count += 1
-                        progress_percent = int((checked_count / total) * 100)
+                        progress_percent = min(100, int((checked_count / total) * 100))
                         results_state['progress'] = progress_percent
+                        results_state['emails'].append({'email': email, 'status': "⚠️ Error"})
                     update_web_interface(email, "⚠️ Error", len(valid_emails), progress_percent, total)
                     progress.update(task, advance=1)
                     live.update(main_layout)
@@ -404,10 +416,44 @@ def live_results():
                 document.addEventListener('DOMContentLoaded', function() {
                     const socket = io();
                     
+                    // Initialize with current state
+                    fetch('/current-state')
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.running) {
+                                document.getElementById('valid-count').textContent = data.valid_count;
+                                const checked = Math.round(data.total * (data.progress/100));
+                                document.getElementById('checked-count').textContent = checked;
+                                document.getElementById('total-count').textContent = data.total;
+                                document.getElementById('progress-fill').style.width = `${data.progress}%`;
+                                document.getElementById('progress-text').textContent = `${Math.round(data.progress)}% Complete`;
+                                
+                                // Display existing results
+                                const resultsDiv = document.getElementById('results');
+                                data.emails.forEach(item => {
+                                    const entry = document.createElement('div');
+                                    entry.className = 'result-item';
+                                    
+                                    if (item.status.includes('Valid')) {
+                                        entry.classList.add('result-valid');
+                                    } else if (item.status.includes('Invalid')) {
+                                        entry.classList.add('result-invalid');
+                                    } else {
+                                        entry.classList.add('result-error');
+                                    }
+                                    
+                                    entry.textContent = `${item.email} - ${item.status}`;
+                                    resultsDiv.appendChild(entry);
+                                });
+                                resultsDiv.scrollTop = resultsDiv.scrollHeight;
+                            }
+                        });
+                    
                     socket.on('update', function(data) {
                         // Update stats
                         document.getElementById('valid-count').textContent = data.valid_count;
-                        document.getElementById('checked-count').textContent = Math.round(data.total * (data.progress/100));
+                        const checked = Math.round(data.total * (data.progress/100));
+                        document.getElementById('checked-count').textContent = checked;
                         document.getElementById('total-count').textContent = data.total;
                         
                         // Update progress bar
@@ -467,6 +513,17 @@ def live_results():
         </body>
         </html>
     ''')
+
+@app.route('/current-state')
+def current_state():
+    with state_lock:
+        return {
+            'running': results_state['running'],
+            'emails': results_state['emails'],
+            'valid_count': results_state['valid_count'],
+            'progress': results_state['progress'],
+            'total': results_state['total']
+        }
 
 def cli_entry():
     parser = argparse.ArgumentParser(description='Email Unmasker by developer.rs')
